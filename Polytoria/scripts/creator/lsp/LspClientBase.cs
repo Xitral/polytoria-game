@@ -149,7 +149,10 @@ public abstract class LspClientBase : IDisposable
 			if (root.TryGetProperty("method", out JsonElement methodReqProp) &&
 				root.TryGetProperty("id", out JsonElement serverRequestId))
 			{
-				HandleServerRequest(methodReqProp.GetString() ?? "", serverRequestId);
+				JsonElement? requestParams = root.TryGetProperty("params", out JsonElement paramsProp)
+					? paramsProp.Clone()
+					: null;
+				HandleServerRequest(methodReqProp.GetString() ?? "", serverRequestId.Clone(), requestParams);
 				return;
 			}
 
@@ -186,7 +189,7 @@ public abstract class LspClientBase : IDisposable
 
 	// Virtual hooks that derived lsp clients can override
 	protected virtual void HandleServerNotification(string method, JsonElement param) { }
-	protected virtual void HandleServerRequest(string method, JsonElement id) { }
+	protected virtual void HandleServerRequest(string method, JsonElement id, JsonElement? param) { }
 
 	public virtual void Dispose()
 	{
