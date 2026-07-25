@@ -115,7 +115,33 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 			Context = new() { TriggerKind = 1 }
 		}, cancellationToken);
 
-		return rawResult.Deserialize(LspJsonContext.Default.LspCompletionItemArray);
+		if (rawResult.ValueKind == JsonValueKind.Array)
+		{
+			return rawResult.Deserialize(LspJsonContext.Default.LspCompletionItemArray);
+		}
+
+		// LSP allows completion responses to be returned as a CompletionList object.
+		if (rawResult.ValueKind == JsonValueKind.Object &&
+			rawResult.TryGetProperty("items", out JsonElement items) &&
+			items.ValueKind == JsonValueKind.Array)
+		{
+			return items.Deserialize(LspJsonContext.Default.LspCompletionItemArray);
+		}
+
+		return null;
+	}
+
+	public Task<string?> RequestInternalSourceAsync(string path, CancellationToken cancellationToken = default)
+	{
+		Dictionary<string, object> parameters = new()
+		{
+			["textDocument"] = new LspTextDocumentIdentifier
+			{
+				Uri = LspHelper.PathToUri(path)
+			}
+		};
+
+		return SendRequestAsync<string>("luau-lsp/debug/viewInternalSource", parameters, cancellationToken);
 	}
 
 	protected override void HandleServerNotification(string method, JsonElement param)
