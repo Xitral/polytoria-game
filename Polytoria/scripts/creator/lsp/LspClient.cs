@@ -27,6 +27,10 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 		LspInitializeParams initParams = new()
 		{
 			RootUri = LspHelper.PathToUri(workspacePath),
+			InitializationOptions = new()
+			{
+				ChangeConfiguration = true
+			},
 			Capabilities = new()
 			{
 				TextDocument = new()
@@ -133,6 +137,12 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 				data.Uri = data.Uri.Replace("%3A", ":");
 				PublishDiagnostics?.Invoke(data);
 			}
+		}
+		else if (method == "window/logMessage" &&
+			param.ValueKind == JsonValueKind.Object &&
+			param.TryGetProperty("message", out JsonElement message))
+		{
+			PT.Print("Luau LSP: ", message.GetString() ?? "");
 		}
 	}
 
