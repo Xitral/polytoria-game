@@ -15,6 +15,7 @@ namespace Polytoria.DocsGen;
 public class LuaDefinitionGenerator
 {
 	private const string CodeHintPath = "res://modules/creator/codehint/luau/";
+	private const string RequirePluginFileName = "polytoria-require.luau";
 	private static readonly string[] SkippedMetamethods = ["__iter"];
 
 	public static void GenerateDocFiles(string atFolder)
@@ -37,6 +38,15 @@ public class LuaDefinitionGenerator
 			if (pathTo.EndsWith(".luau"))
 			{
 				string content = Godot.FileAccess.GetFileAsString(pathTo);
+
+				// Source-transformation plugins are copied alongside the generated
+				// definitions, but must not be appended to def.d.luau.
+				if (item == RequirePluginFileName)
+				{
+					File.WriteAllText(atFolder.PathJoin(RequirePluginFileName), content);
+					continue;
+				}
+
 				builder.AppendLine(content);
 			}
 		}
@@ -67,7 +77,7 @@ public class LuaDefinitionGenerator
 			{
 				builder.AppendLine($"\t{item}:{e.Name}");
 			}
-			builder.AppendLine($"end");
+			builder.AppendLine("end");
 		}
 
 		builder.AppendLine($"type ENUM_LIST = {{");
@@ -156,11 +166,10 @@ public class LuaDefinitionGenerator
 
 			if (!m.IsSemiStatic) { args.Insert(0, "self"); }
 			else { args[0] = "self"; }
-
 			builder.AppendLine($"\tfunction {m.Name}({string.Join(", ", args)}): {ProcessType(m.ReturnType ?? "")}");
 		}
 
-		builder.AppendLine($"end");
+		builder.AppendLine("end");
 
 		if (hasStatic)
 		{
@@ -199,7 +208,7 @@ public class LuaDefinitionGenerator
 			builder.AppendLine($"{m.Name}: ({string.Join(", ", args)}) -> ({ProcessType(m.ReturnType ?? "")}),");
 		}
 
-		builder.AppendLine($"}}");
+		builder.AppendLine("}");
 
 		return builder.ToString();
 	}
