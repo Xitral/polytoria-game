@@ -159,19 +159,32 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 		};
 	}
 
-	protected override async void HandleServerRequest(string method, JsonElement id)
+	protected override async void HandleServerRequest(string method, JsonElement id, JsonElement? param)
 	{
 		try
 		{
 			// Handle workspace/configuration request
 			if (method == "workspace/configuration")
 			{
-				Dictionary<string, object> configuration = CreateLuauConfiguration();
+				int configurationCount = 1;
+				if (param.HasValue &&
+					param.Value.ValueKind == JsonValueKind.Object &&
+					param.Value.TryGetProperty("items", out JsonElement items) &&
+					items.ValueKind == JsonValueKind.Array)
+				{
+					configurationCount = items.GetArrayLength();
+				}
+
+				object[] configurations = new object[configurationCount];
+				for (int i = 0; i < configurations.Length; i++)
+				{
+					configurations[i] = CreateLuauConfiguration();
+				}
+
 				LspResponse response = new()
 				{
 					Id = id.Clone(),
-					// Luau LSP currently requests global and workspace configurations.
-					Result = new object[] { configuration, configuration }
+					Result = configurations
 				};
 
 				await WriteMessageAsync(response, CancellationToken.None);
