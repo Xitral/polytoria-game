@@ -16,6 +16,8 @@ namespace Polytoria.Creator.LSP;
 
 public class LspClient(Stream input, Stream output) : LspClientBase(input, output)
 {
+	private const string RequirePluginPath = ".poly/luau/polytoria-require.luau";
+
 	public readonly Dictionary<string, string> LspPathToFull = new(StringComparer.OrdinalIgnoreCase);
 	public readonly Dictionary<string, string> FullToLspPath = new(StringComparer.OrdinalIgnoreCase);
 	public event Action<LspPublishDiagnosticsParams>? PublishDiagnostics;
@@ -134,6 +136,29 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 		}
 	}
 
+	private static Dictionary<string, object> CreateLuauConfiguration()
+	{
+		return new()
+		{
+			["platform"] = new Dictionary<string, object>
+			{
+				["type"] = "standard"
+			},
+			["types"] = new Dictionary<string, object>
+			{
+				["definitionFiles"] = new Dictionary<string, object>
+				{
+					["@poly"] = ".poly/luau/def.d.luau"
+				}
+			},
+			["plugins"] = new Dictionary<string, object>
+			{
+				["enabled"] = true,
+				["paths"] = new[] { RequirePluginPath }
+			}
+		};
+	}
+
 	protected override async void HandleServerRequest(string method, JsonElement id)
 	{
 		try
@@ -141,11 +166,12 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 			// Handle workspace/configuration request
 			if (method == "workspace/configuration")
 			{
-				// Return empty configuration
+				Dictionary<string, object> configuration = CreateLuauConfiguration();
 				LspResponse response = new()
 				{
 					Id = id.Clone(),
-					Result = new object[] { new(), new() }
+					// Luau LSP currently requests global and workspace configurations.
+					Result = new object[] { configuration, configuration }
 				};
 
 				await WriteMessageAsync(response, CancellationToken.None);
