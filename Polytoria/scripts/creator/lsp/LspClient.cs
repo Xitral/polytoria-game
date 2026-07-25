@@ -16,7 +16,7 @@ namespace Polytoria.Creator.LSP;
 
 public class LspClient(Stream input, Stream output) : LspClientBase(input, output)
 {
-	private const string RequirePluginPath = ".poly/luau/polytoria-require.luau";
+	private const string RequirePluginPath = "./.poly/luau/polytoria-require.luau";
 
 	public readonly Dictionary<string, string> LspPathToFull = new(StringComparer.OrdinalIgnoreCase);
 	public readonly Dictionary<string, string> FullToLspPath = new(StringComparer.OrdinalIgnoreCase);
@@ -27,10 +27,6 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 		LspInitializeParams initParams = new()
 		{
 			RootUri = LspHelper.PathToUri(workspacePath),
-			InitializationOptions = new()
-			{
-				ChangeConfiguration = true
-			},
 			Capabilities = new()
 			{
 				TextDocument = new()
@@ -138,7 +134,7 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 				PublishDiagnostics?.Invoke(data);
 			}
 		}
-		else if (method == "window/logMessage" &&
+		else if ((method == "window/logMessage" || method == "window/showMessage") &&
 			param.ValueKind == JsonValueKind.Object &&
 			param.TryGetProperty("message", out JsonElement message))
 		{
@@ -154,13 +150,6 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 			{
 				["type"] = "standard"
 			},
-			["types"] = new Dictionary<string, object>
-			{
-				["definitionFiles"] = new Dictionary<string, object>
-				{
-					["@poly"] = ".poly/luau/def.d.luau"
-				}
-			},
 			["plugins"] = new Dictionary<string, object>
 			{
 				["enabled"] = true,
@@ -173,7 +162,6 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 	{
 		try
 		{
-			// Handle workspace/configuration request
 			if (method == "workspace/configuration")
 			{
 				int configurationCount = 1;
@@ -191,6 +179,8 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 					configurations[i] = CreateLuauConfiguration();
 				}
 
+				PT.Print("Luau LSP requested ", configurationCount, " configuration entries; enabling require plugin at ", RequirePluginPath);
+
 				LspResponse response = new()
 				{
 					Id = id.Clone(),
@@ -201,7 +191,6 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 			}
 			else
 			{
-				// For other, send empty result
 				LspResponse response = new()
 				{
 					Id = id.Clone(),
