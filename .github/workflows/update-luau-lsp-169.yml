@@ -6,6 +6,11 @@ on:
       - feature/module-intellisense
     paths:
       - .github/workflows/update-luau-lsp-169.yml
+  pull_request:
+    branches:
+      - feature/module-intellisense
+    paths:
+      - .github/trigger-luau-lsp-update
   workflow_dispatch:
 
 permissions:
