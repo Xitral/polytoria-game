@@ -31,6 +31,7 @@ internal sealed class LuauLspTestWorkspace : IDisposable
 		RootPath = Path.Join(Path.GetTempPath(), namePrefix + "-" + Guid.NewGuid().ToString("N"));
 		Directory.CreateDirectory(PluginDirectory);
 		File.WriteAllText(Path.Join(RootPath, ".luaurc"), "{\n\t\"languageMode\": \"nocheck\"\n}\n");
+		File.WriteAllText(Path.Join(PluginDirectory, "def.d.luau"), "");
 		CopyPlugin("polytoria-require.luau");
 		CopyPlugin("polytoria-module-types.luau");
 	}
@@ -164,7 +165,7 @@ internal sealed class LuauLspTestWorkspace : IDisposable
 		ProcessStartInfo startInfo = new()
 		{
 			FileName = executablePath,
-			Arguments = "lsp --stdio",
+			Arguments = "lsp --stdio --definitions=@poly=.poly/luau/def.d.luau",
 			RedirectStandardInput = true,
 			RedirectStandardOutput = true,
 			RedirectStandardError = true,
