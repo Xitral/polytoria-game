@@ -25,43 +25,60 @@ public static class LuauModuleMapService
 		"# M\tworld-id\tmodule-world-path\tmodule-file\n";
 
 	/// <summary>
-	/// Rebuilds the map and returns true when its contents changed.
+	/// Rebuilds the map by scanning every open world. Prefer the tracked-script
+	/// overload for editor hot paths.
 	/// </summary>
 	public static bool Generate(CreatorSession session)
+	{
+		List<Script> scripts = [];
+		foreach (World world in session.OpenedWorlds)
+		{
+			foreach (Instance instance in world.GetDescendants())
+			{
+				if (instance is Script script)
+				{
+					scripts.Add(script);
+				}
+			}
+		}
+
+		return Generate(session, scripts);
+	}
+
+	/// <summary>
+	/// Rebuilds the map from an already maintained script index and returns true
+	/// when the generated contents changed.
+	/// </summary>
+	public static bool Generate(CreatorSession session, IEnumerable<Script> scripts)
 	{
 		string mapDirectory = Path.Join(session.PolyFolderPath, "luau");
 		Directory.CreateDirectory(mapDirectory);
 
-		SortedSet<string> rows = new(StringComparer.Ordinal);
-
+		Dictionary<World, string> worldIds = [];
 		for (int worldIndex = 0; worldIndex < session.OpenedWorlds.Count; worldIndex++)
 		{
-			World world = session.OpenedWorlds[worldIndex];
-			string worldId = worldIndex.ToString(System.Globalization.CultureInfo.InvariantCulture);
-			List<ScriptEntry> scripts = [];
+			worldIds[session.OpenedWorlds[worldIndex]] = worldIndex.ToString(System.Globalization.CultureInfo.InvariantCulture);
+		}
 
-			foreach (Instance instance in world.GetDescendants())
+		SortedSet<string> rows = new(StringComparer.Ordinal);
+		foreach (Script script in scripts)
+		{
+			if (!worldIds.TryGetValue(script.Root, out string? worldId))
 			{
-				if (instance is not Script script)
-				{
-					continue;
-				}
-
-				ScriptEntry? entry = CreateEntry(session, script);
-				if (entry.HasValue)
-				{
-					scripts.Add(entry.Value);
-				}
+				continue;
 			}
 
-			foreach (ScriptEntry source in scripts)
+			ScriptEntry? entry = CreateEntry(session, script);
+			if (!entry.HasValue)
 			{
-				rows.Add(string.Join('\t', "S", worldId, source.ProjectPath, source.WorldPath));
+				continue;
+			}
 
-				if (source.Script is ModuleScript)
-				{
-					rows.Add(string.Join('\t', "M", worldId, source.WorldPath, source.ProjectPath));
-				}
+			ScriptEntry value = entry.Value;
+			rows.Add(string.Join('\t', "S", worldId, value.ProjectPath, value.WorldPath));
+			if (script is ModuleScript)
+			{
+				rows.Add(string.Join('\t', "M", worldId, value.WorldPath, value.ProjectPath));
 			}
 		}
 
@@ -145,7 +162,7 @@ public static class LuauModuleMapService
 			return null;
 		}
 
-		return new ScriptEntry(script, relativePath, worldPath);
+		return new ScriptEntry(relativePath, worldPath);
 	}
 
 	private static bool ContainsUnsupportedMapCharacter(string value)
@@ -153,5 +170,5 @@ public static class LuauModuleMapService
 		return value.Contains('\t') || value.Contains('\r') || value.Contains('\n');
 	}
 
-	private readonly record struct ScriptEntry(Script Script, string ProjectPath, string WorldPath);
+	private readonly record struct ScriptEntry(string ProjectPath, string WorldPath);
 }
