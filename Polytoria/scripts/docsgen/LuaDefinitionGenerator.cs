@@ -15,7 +15,11 @@ namespace Polytoria.DocsGen;
 public class LuaDefinitionGenerator
 {
 	private const string CodeHintPath = "res://modules/creator/codehint/luau/";
-	private const string RequirePluginFileName = "polytoria-require.luau";
+	private static readonly HashSet<string> PluginFileNames =
+	[
+		"polytoria-require.luau",
+		"polytoria-module-types.luau"
+	];
 	private static readonly string[] SkippedMetamethods = ["__iter"];
 
 	public static void GenerateDocFiles(string atFolder)
@@ -41,9 +45,9 @@ public class LuaDefinitionGenerator
 
 				// Source-transformation plugins are copied alongside the generated
 				// definitions, but must not be appended to def.d.luau.
-				if (item == RequirePluginFileName)
+				if (PluginFileNames.Contains(item))
 				{
-					File.WriteAllText(atFolder.PathJoin(RequirePluginFileName), content);
+					File.WriteAllText(atFolder.PathJoin(item), content);
 					continue;
 				}
 
@@ -177,52 +181,5 @@ public class LuaDefinitionGenerator
 		}
 
 		return builder.ToString();
-	}
-
-	public static string GenerateStaticClass(ScriptClass c)
-	{
-		StringBuilder builder = new();
-
-		builder.AppendLine($"declare {c.Name}: {{");
-
-		foreach (ScriptProperty p in c.Properties)
-		{
-			if (!p.IsStatic) continue;
-			builder.AppendLine($"\t{p.Name} : {ProcessType(p.Type ?? "nil")},");
-		}
-
-		foreach (ScriptMethod m in c.Methods)
-		{
-			if (m.IsObsolete) continue;
-			if (!m.IsStatic) continue;
-			// Ignore metamethods
-			if (m.Name.StartsWith("__")) continue;
-			List<string> args = [];
-
-			foreach (ScriptParameter param in m.Parameters)
-			{
-				if (param.Type == null) continue;
-				args.Add($"{ProcessType(param.Type) + (param.IsOptional ? "?" : "")}");
-			}
-
-			builder.AppendLine($"{m.Name}: ({string.Join(", ", args)}) -> ({ProcessType(m.ReturnType ?? "")}),");
-		}
-
-		builder.AppendLine("}");
-
-		return builder.ToString();
-	}
-
-	private static string ProcessType(string t)
-	{
-		if (t == "function")
-		{
-			return "() -> nil";
-		}
-		else if (t == "table")
-		{
-			return "{ any }";
-		}
-		return t;
 	}
 }
