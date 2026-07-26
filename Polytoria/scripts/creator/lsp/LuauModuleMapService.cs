@@ -6,7 +6,6 @@ using Polytoria.Datamodel;
 using System;
 using System.Collections.Generic;
 using System.IO;
-using System.Linq;
 using System.Text;
 using Script = Polytoria.Datamodel.Script;
 
@@ -39,22 +38,30 @@ public static class LuauModuleMapService
 		{
 			World world = session.OpenedWorlds[worldIndex];
 			string worldId = worldIndex.ToString(System.Globalization.CultureInfo.InvariantCulture);
+			List<ScriptEntry> scripts = [];
 
-			List<ScriptEntry> scripts = world.GetDescendants()
-				.OfType<Script>()
-				.Select(script => CreateEntry(session, script))
-				.Where(entry => entry.HasValue)
-				.Select(entry => entry!.Value)
-				.ToList();
+			foreach (Instance instance in world.GetDescendants())
+			{
+				if (instance is not Script script)
+				{
+					continue;
+				}
+
+				ScriptEntry? entry = CreateEntry(session, script);
+				if (entry.HasValue)
+				{
+					scripts.Add(entry.Value);
+				}
+			}
 
 			foreach (ScriptEntry source in scripts)
 			{
 				rows.Add(string.Join('\t', "S", worldId, source.ProjectPath, source.WorldPath));
-			}
 
-			foreach (ScriptEntry module in scripts.Where(entry => entry.Script is ModuleScript))
-			{
-				rows.Add(string.Join('\t', "M", worldId, module.WorldPath, module.ProjectPath));
+				if (source.Script is ModuleScript)
+				{
+					rows.Add(string.Join('\t', "M", worldId, source.WorldPath, source.ProjectPath));
+				}
 			}
 		}
 
