@@ -23,9 +23,11 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 	];
 
 	private readonly TaskCompletionSource _workspaceIndexed = new(TaskCreationOptions.RunContinuationsAsynchronously);
+	private readonly TaskCompletionSource _documentsReplayed = new(TaskCreationOptions.RunContinuationsAsynchronously);
 	private readonly SemaphoreSlim _documentStateGate = new(1, 1);
 	private readonly Dictionary<string, OpenDocument> _openDocuments = new(StringComparer.OrdinalIgnoreCase);
 	private int _indexTimeoutReported;
+	private int _replayTimeoutReported;
 	private int _pluginReplayStarted;
 
 	public readonly Dictionary<string, string> LspPathToFull = new(StringComparer.OrdinalIgnoreCase);
@@ -109,6 +111,15 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 			Interlocked.Exchange(ref _indexTimeoutReported, 1) == 0)
 		{
 			PT.PrintWarn("Timed out waiting for Luau LSP workspace indexing; continuing with the current language-server state");
+		}
+	}
+
+	private async Task WaitUntilDocumentsReplayedAsync(CancellationToken cancellationToken)
+	{
+		if (!await WaitForReadySignalAsync(_documentsReplayed, cancellationToken) &&
+			Interlocked.Exchange(ref _replayTimeoutReported, 1) == 0)
+		{
+			PT.PrintWarn("Timed out waiting for Luau plugins to be reapplied to open scripts; continuing with the current language-server state");
 		}
 	}
 
@@ -205,10 +216,6 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 			KeyValuePair<string, OpenDocument>[] documents = [.. _openDocuments];
 			foreach ((string path, OpenDocument document) in documents)
 			{
-				// The first didOpen is intentionally sent immediately because Luau LSP does
-				// not begin loading the configured transformation plugins until managed
-				// documents exist. Once the plugins report ready, replaying each document
-				// makes the current module map and module-type transformation take effect.
 				await SendDidCloseNotificationAsync(path);
 				await SendDidOpenNotificationAsync(path, document.LanguageId, document.Text, document.Version);
 			}
@@ -224,13 +231,23 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 		}
 		finally
 		{
+			_documentsReplayed.TrySetResult();
 			_documentStateGate.Release();
+		}
+	}
+
+	private void StartDocumentReplayIfNeeded()
+	{
+		if (Interlocked.Exchange(ref _pluginReplayStarted, 1) == 0)
+		{
+			_ = ReplayOpenDocumentsAfterPluginLoadAsync();
 		}
 	}
 
 	public async Task<LspCompletionItem[]?> RequestCompletionAsync(string path, int line, int character, CancellationToken cancellationToken)
 	{
 		await WaitUntilWorkspaceIndexedAsync(cancellationToken);
+		await WaitUntilDocumentsReplayedAsync(cancellationToken);
 
 		JsonElement rawResult = await SendRequestAsync<JsonElement>("textDocument/completion", new LspCompletionParams
 		{
@@ -289,14 +306,16 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 			string messageText = message.GetString() ?? "";
 			PT.Print("Luau LSP: ", messageText);
 
-			if (messageText.StartsWith($"Loaded {PluginPaths.Length} of {PluginPaths.Length} plugins", StringComparison.Ordinal) &&
-				Interlocked.Exchange(ref _pluginReplayStarted, 1) == 0)
+			if (messageText.StartsWith($"Loaded {PluginPaths.Length} of {PluginPaths.Length} plugins", StringComparison.Ordinal))
 			{
-				_ = ReplayOpenDocumentsAfterPluginLoadAsync();
+				StartDocumentReplayIfNeeded();
 			}
 
 			if (messageText.StartsWith("Indexed ", StringComparison.Ordinal))
 			{
+				// This also acts as a fallback if a future Luau LSP version changes the
+				// plugin summary wording.
+				StartDocumentReplayIfNeeded();
 				_workspaceIndexed.TrySetResult();
 			}
 		}
