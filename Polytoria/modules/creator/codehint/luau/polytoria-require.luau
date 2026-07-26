@@ -1,5 +1,11 @@
 local MAP_FILE_NAME = "polytoria-module-map.tsv"
 
+type ModuleLookup = { [string]: string | false }
+type SourceContext = {
+	sourceWorldPath: string,
+	modules: ModuleLookup,
+}
+
 local function normalizePath(path: string): string
 	local normalized = string.gsub(path, "\\", "/")
 	normalized = string.gsub(normalized, "/+$", "")
@@ -26,10 +32,10 @@ local function getProjectRelativePath(context: PluginContext): string?
 	return string.sub(filePath, #prefix + 1)
 end
 
-local function readModuleContexts(context: PluginContext): ({ [string]: { [string]: string | false } }, string)?
+local function readModuleContexts(context: PluginContext): ({ SourceContext }?, string?)
 	local sourceFile = getProjectRelativePath(context)
 	if sourceFile == nil then
-		return nil
+		return nil, nil
 	end
 
 	local rootUri = lsp.workspace.getRootUri()
@@ -39,36 +45,67 @@ local function readModuleContexts(context: PluginContext): ({ [string]: { [strin
 	end)
 
 	if not ok or type(mapContent) ~= "string" then
-		return nil
+		return nil, nil
 	end
 
 	local sourceKey = string.lower(normalizePath(sourceFile))
-	local contexts: { [string]: { [string]: string | false } } = {}
+	local sourcePathsByWorld: { [string]: { string } } = {}
+	local modulesByWorld: { [string]: ModuleLookup } = {}
 
 	for line in string.gmatch(mapContent, "[^\r\n]+") do
 		if string.sub(line, 1, 1) ~= "#" then
-			local mappedSource, sourceWorldPath, moduleWorldPath, moduleFile = string.match(
+			local sourceWorldId, mappedSource, sourceWorldPath = string.match(
 				line,
-				"^([^\t]*)\t([^\t]*)\t([^\t]*)\t([^\t]*)$"
+				"^S\t([^\t]*)\t([^\t]*)\t([^\t]*)$"
 			)
 
-			if mappedSource ~= nil and string.lower(normalizePath(mappedSource)) == sourceKey then
-				local modules = contexts[sourceWorldPath]
-				if modules == nil then
-					modules = {}
-					contexts[sourceWorldPath] = modules
+			if sourceWorldId ~= nil and string.lower(normalizePath(mappedSource)) == sourceKey then
+				local sourcePaths = sourcePathsByWorld[sourceWorldId]
+				if sourcePaths == nil then
+					sourcePaths = {}
+					sourcePathsByWorld[sourceWorldId] = sourcePaths
 				end
+				table.insert(sourcePaths, sourceWorldPath)
+			else
+				local moduleWorldId, moduleWorldPath, moduleFile = string.match(
+					line,
+					"^M\t([^\t]*)\t([^\t]*)\t([^\t]*)$"
+				)
 
-				local previous = modules[moduleWorldPath]
-				if previous == nil or previous == moduleFile then
-					modules[moduleWorldPath] = moduleFile
-				else
-					-- The same source file/world path is open in multiple worlds and points
-					-- at different files. Leave it unresolved instead of guessing.
-					modules[moduleWorldPath] = false
+				if moduleWorldId ~= nil then
+					local modules = modulesByWorld[moduleWorldId]
+					if modules == nil then
+						modules = {}
+						modulesByWorld[moduleWorldId] = modules
+					end
+
+					local previous = modules[moduleWorldPath]
+					if previous == nil or previous == moduleFile then
+						modules[moduleWorldPath] = moduleFile
+					else
+						-- Duplicate world paths with different linked files are ambiguous.
+						modules[moduleWorldPath] = false
+					end
 				end
 			end
 		end
+	end
+
+	local contexts: { SourceContext } = {}
+	for worldId, sourcePaths in sourcePathsByWorld do
+		local modules = modulesByWorld[worldId]
+		if modules ~= nil then
+			for _, sourceWorldPath in sourcePaths do
+				table.insert(contexts, {
+					sourceWorldPath = sourceWorldPath,
+					modules = modules,
+				})
+			end
+		end
+	end
+
+	if #contexts == 0 then
+		return nil, nil
 	end
 
 	return contexts, sourceFile
@@ -157,17 +194,13 @@ local function makeRelativeRequirePath(sourceFile: string, moduleFile: string): 
 	return relative
 end
 
-local function resolveRequire(
-	expression: string,
-	contexts: { [string]: { [string]: string | false } },
-	sourceFile: string
-): string?
+local function resolveRequire(expression: string, contexts: { SourceContext }, sourceFile: string): string?
 	local resolvedFile: string? = nil
 
-	for sourceWorldPath, modules in contexts do
-		local moduleWorldPath = resolveScriptExpression(sourceWorldPath, expression)
+	for _, sourceContext in contexts do
+		local moduleWorldPath = resolveScriptExpression(sourceContext.sourceWorldPath, expression)
 		if moduleWorldPath ~= nil then
-			local moduleFile = modules[moduleWorldPath]
+			local moduleFile = sourceContext.modules[moduleWorldPath]
 			if type(moduleFile) == "string" then
 				if resolvedFile == nil then
 					resolvedFile = moduleFile
@@ -251,12 +284,11 @@ end
 
 return {
 	transformSource = function(source: string, context: PluginContext): { TextEdit }?
-		local mapResult = readModuleContexts(context)
-		if mapResult == nil then
+		local contexts, sourceFile = readModuleContexts(context)
+		if contexts == nil or sourceFile == nil then
 			return nil
 		end
 
-		local contexts, sourceFile = mapResult
 		local edits = {}
 		local index = 1
 
@@ -277,6 +309,8 @@ return {
 				end
 			elseif string.sub(source, index, index + 6) == "require"
 				and not isIdentifierByte(string.byte(source, index - 1))
+				and string.byte(source, index - 1) ~= 46
+				and string.byte(source, index - 1) ~= 58
 				and not isIdentifierByte(string.byte(source, index + 7)) then
 				local cursor = skipWhitespace(source, index + 7)
 				if string.byte(source, cursor) == 40 then
