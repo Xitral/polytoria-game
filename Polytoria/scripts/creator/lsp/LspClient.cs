@@ -75,7 +75,7 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 
 		// Do not wait for indexing here. Blocking initialization also blocks every
 		// editor open/change/completion call behind LuaCompletionService's gate.
-		// Completion requests wait for plugin readiness independently instead.
+		// Completion requests wait for workspace readiness independently instead.
 	}
 
 	private async Task WaitUntilCompletionReadyAsync(CancellationToken cancellationToken)
@@ -85,7 +85,7 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 			return;
 		}
 
-		using CancellationTokenSource timeout = new(TimeSpan.FromSeconds(5));
+		using CancellationTokenSource timeout = new(TimeSpan.FromSeconds(10));
 		using CancellationTokenSource combined = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeout.Token);
 
 		try
@@ -96,11 +96,11 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 		{
 			if (Interlocked.Exchange(ref _readinessTimeoutReported, 1) == 0)
 			{
-				PT.PrintWarn("Timed out waiting for Luau LSP plugins; continuing with the current language-server state");
+				PT.PrintWarn("Timed out waiting for Luau LSP workspace indexing; continuing with the current language-server state");
 			}
 
 			// Avoid adding the same delay to every later completion request. A later
-			// plugin/index message can still call TrySetResult harmlessly.
+			// index message can still call TrySetResult harmlessly.
 			_completionReady.TrySetResult();
 		}
 	}
@@ -146,9 +146,9 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 
 	public async Task<LspCompletionItem[]?> RequestCompletionAsync(string path, int line, int character, CancellationToken cancellationToken)
 	{
-		// A restarted Luau server acknowledges initialize before loading the source
-		// transformation plugins. Waiting here prevents the first completion request
-		// from racing that load while leaving the rest of Creator responsive.
+		// A restarted Luau server acknowledges initialize and loads plugins before
+		// it finishes parsing the workspace. Module completion requires the indexed
+		// module graph, so wait here without blocking the rest of Creator startup.
 		await WaitUntilCompletionReadyAsync(cancellationToken);
 
 		JsonElement rawResult = await SendRequestAsync<JsonElement>("textDocument/completion", new LspCompletionParams
@@ -208,11 +208,9 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 			string messageText = message.GetString() ?? "";
 			PT.Print("Luau LSP: ", messageText);
 
-			// Module completion only depends on the transformation plugins being loaded.
-			// Indexing may finish afterward and is still useful, but it should not block
-			// the editor or ordinary completion startup.
-			if (messageText.StartsWith($"Loaded {PluginPaths.Length} of {PluginPaths.Length} plugins", StringComparison.Ordinal) ||
-				messageText.StartsWith("Indexed ", StringComparison.Ordinal))
+			// The index completion message is emitted after configuration, definitions,
+			// plugins, and workspace files have been loaded and parsed.
+			if (messageText.StartsWith("Indexed ", StringComparison.Ordinal))
 			{
 				_completionReady.TrySetResult();
 			}
