@@ -22,8 +22,10 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 		"./.poly/luau/polytoria-module-types.luau"
 	];
 
-	private readonly TaskCompletionSource _completionReady = new(TaskCreationOptions.RunContinuationsAsynchronously);
-	private int _readinessTimeoutReported;
+	private readonly TaskCompletionSource _pluginsReady = new(TaskCreationOptions.RunContinuationsAsynchronously);
+	private readonly TaskCompletionSource _workspaceIndexed = new(TaskCreationOptions.RunContinuationsAsynchronously);
+	private int _pluginTimeoutReported;
+	private int _indexTimeoutReported;
 
 	public readonly Dictionary<string, string> LspPathToFull = new(StringComparer.OrdinalIgnoreCase);
 	public readonly Dictionary<string, string> FullToLspPath = new(StringComparer.OrdinalIgnoreCase);
@@ -72,15 +74,15 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 
 		await SendRequestAsync<LspInitializeResult>("initialize", initParams);
 		await SendNotificationAsync("initialized", new EmptyParams());
-
-		// Do not wait for indexing here. Blocking initialization also blocks every
-		// editor open/change/completion call behind LuaCompletionService's gate.
-		// Completion requests wait for workspace readiness independently instead.
 	}
 
-	private async Task WaitUntilCompletionReadyAsync(CancellationToken cancellationToken)
+	private async Task WaitForReadySignalAsync(
+		TaskCompletionSource signal,
+		string timeoutMessage,
+		ref int timeoutReported,
+		CancellationToken cancellationToken)
 	{
-		if (_completionReady.Task.IsCompleted)
+		if (signal.Task.IsCompleted)
 		{
 			return;
 		}
@@ -90,27 +92,51 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 
 		try
 		{
-			await _completionReady.Task.WaitAsync(combined.Token);
+			await signal.Task.WaitAsync(combined.Token);
 		}
 		catch (OperationCanceledException) when (timeout.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
 		{
-			if (Interlocked.Exchange(ref _readinessTimeoutReported, 1) == 0)
+			if (Interlocked.Exchange(ref timeoutReported, 1) == 0)
 			{
-				PT.PrintWarn("Timed out waiting for Luau LSP workspace indexing; continuing with the current language-server state");
+				PT.PrintWarn(timeoutMessage);
 			}
 
-			// Avoid adding the same delay to every later completion request. A later
-			// index message can still call TrySetResult harmlessly.
-			_completionReady.TrySetResult();
+			// Do not impose the same timeout repeatedly if a future server version does
+			// not emit the expected informational log message.
+			signal.TrySetResult();
 		}
 	}
 
-	public Task DidOpenAsync(string path, string languageId, string text)
+	private Task WaitUntilPluginsReadyAsync(CancellationToken cancellationToken = default)
 	{
+		return WaitForReadySignalAsync(
+			_pluginsReady,
+			"Timed out waiting for Luau LSP plugins; opening documents with the current language-server state",
+			ref _pluginTimeoutReported,
+			cancellationToken);
+	}
+
+	private Task WaitUntilWorkspaceIndexedAsync(CancellationToken cancellationToken)
+	{
+		return WaitForReadySignalAsync(
+			_workspaceIndexed,
+			"Timed out waiting for Luau LSP workspace indexing; continuing with the current language-server state",
+			ref _indexTimeoutReported,
+			cancellationToken);
+	}
+
+	public async Task DidOpenAsync(string path, string languageId, string text)
+	{
+		// Source transformations are selected when a managed document is opened.
+		// Opening before the plugins load leaves ModuleScripts parsed in the project's
+		// nocheck mode until a later save, which was the cause of moved modules only
+		// acquiring autocomplete after Ctrl+S.
+		await WaitUntilPluginsReadyAsync();
+
 		string p = LspHelper.PathToUri(path);
 		LspPathToFull[p] = path;
 		FullToLspPath[path] = p;
-		return SendNotificationAsync("textDocument/didOpen", new LspDidOpenParams
+		await SendNotificationAsync("textDocument/didOpen", new LspDidOpenParams
 		{
 			TextDocument = new LspTextDocumentItem
 			{
@@ -146,10 +172,7 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 
 	public async Task<LspCompletionItem[]?> RequestCompletionAsync(string path, int line, int character, CancellationToken cancellationToken)
 	{
-		// A restarted Luau server acknowledges initialize and loads plugins before
-		// it finishes parsing the workspace. Module completion requires the indexed
-		// module graph, so wait here without blocking the rest of Creator startup.
-		await WaitUntilCompletionReadyAsync(cancellationToken);
+		await WaitUntilWorkspaceIndexedAsync(cancellationToken);
 
 		JsonElement rawResult = await SendRequestAsync<JsonElement>("textDocument/completion", new LspCompletionParams
 		{
@@ -208,11 +231,17 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 			string messageText = message.GetString() ?? "";
 			PT.Print("Luau LSP: ", messageText);
 
-			// The index completion message is emitted after configuration, definitions,
-			// plugins, and workspace files have been loaded and parsed.
+			if (messageText.StartsWith($"Loaded {PluginPaths.Length} of {PluginPaths.Length} plugins", StringComparison.Ordinal))
+			{
+				_pluginsReady.TrySetResult();
+			}
+
 			if (messageText.StartsWith("Indexed ", StringComparison.Ordinal))
 			{
-				_completionReady.TrySetResult();
+				// Indexing necessarily happens after configuration/plugin setup. Mark both
+				// ready as a resilient fallback if the plugin summary wording changes.
+				_pluginsReady.TrySetResult();
+				_workspaceIndexed.TrySetResult();
 			}
 		}
 	}
