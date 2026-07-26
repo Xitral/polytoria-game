@@ -76,15 +76,13 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 		await SendNotificationAsync("initialized", new EmptyParams());
 	}
 
-	private async Task WaitForReadySignalAsync(
+	private static async Task<bool> WaitForReadySignalAsync(
 		TaskCompletionSource signal,
-		string timeoutMessage,
-		ref int timeoutReported,
 		CancellationToken cancellationToken)
 	{
 		if (signal.Task.IsCompleted)
 		{
-			return;
+			return true;
 		}
 
 		using CancellationTokenSource timeout = new(TimeSpan.FromSeconds(10));
@@ -93,36 +91,33 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 		try
 		{
 			await signal.Task.WaitAsync(combined.Token);
+			return true;
 		}
 		catch (OperationCanceledException) when (timeout.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
 		{
-			if (Interlocked.Exchange(ref timeoutReported, 1) == 0)
-			{
-				PT.PrintWarn(timeoutMessage);
-			}
-
 			// Do not impose the same timeout repeatedly if a future server version does
 			// not emit the expected informational log message.
 			signal.TrySetResult();
+			return false;
 		}
 	}
 
-	private Task WaitUntilPluginsReadyAsync(CancellationToken cancellationToken = default)
+	private async Task WaitUntilPluginsReadyAsync(CancellationToken cancellationToken = default)
 	{
-		return WaitForReadySignalAsync(
-			_pluginsReady,
-			"Timed out waiting for Luau LSP plugins; opening documents with the current language-server state",
-			ref _pluginTimeoutReported,
-			cancellationToken);
+		if (!await WaitForReadySignalAsync(_pluginsReady, cancellationToken) &&
+			Interlocked.Exchange(ref _pluginTimeoutReported, 1) == 0)
+		{
+			PT.PrintWarn("Timed out waiting for Luau LSP plugins; opening documents with the current language-server state");
+		}
 	}
 
-	private Task WaitUntilWorkspaceIndexedAsync(CancellationToken cancellationToken)
+	private async Task WaitUntilWorkspaceIndexedAsync(CancellationToken cancellationToken)
 	{
-		return WaitForReadySignalAsync(
-			_workspaceIndexed,
-			"Timed out waiting for Luau LSP workspace indexing; continuing with the current language-server state",
-			ref _indexTimeoutReported,
-			cancellationToken);
+		if (!await WaitForReadySignalAsync(_workspaceIndexed, cancellationToken) &&
+			Interlocked.Exchange(ref _indexTimeoutReported, 1) == 0)
+		{
+			PT.PrintWarn("Timed out waiting for Luau LSP workspace indexing; continuing with the current language-server state");
+		}
 	}
 
 	public async Task DidOpenAsync(string path, string languageId, string text)
