@@ -58,7 +58,7 @@ public class LuaDefinitionGenerator
 		File.WriteAllText(atFolder.PathJoin("def.json"), JsonSerializer.Serialize(refer, APIRefGenerationContext.Default.APIReferenceRoot));
 
 		// Add PTSignal type definitions
-		builder.AppendLine("declare class PTSignalConnection");
+		builder.AppendLine("declare extern type PTSignalConnection with");
 		builder.AppendLine("\tfunction Disconnect(self): ()");
 		builder.AppendLine("end");
 		builder.AppendLine();
@@ -71,26 +71,26 @@ public class LuaDefinitionGenerator
 		builder.AppendLine("}");
 		builder.AppendLine();
 
-		builder.AppendLine($"declare class Enum end");
+		builder.AppendLine("declare extern type Enum with end");
 
 		foreach (ScriptEnum e in refer.Enums)
 		{
-			builder.AppendLine($"declare class {e.Name} end");
-			builder.AppendLine($"declare class {e.InternalName} extends Enum");
+			builder.AppendLine($"declare extern type {e.Name} with end");
+			builder.AppendLine($"declare extern type {e.InternalName} extends Enum with");
 			foreach (string item in e.Options)
 			{
 				builder.AppendLine($"\t{item}:{e.Name}");
 			}
-			builder.AppendLine($"end");
+			builder.AppendLine("end");
 		}
 
-		builder.AppendLine($"type ENUM_LIST = {{");
+		builder.AppendLine("type ENUM_LIST = {");
 		foreach (ScriptEnum e in refer.Enums)
 		{
 			builder.AppendLine($"\t{e.Name}:{e.InternalName},");
 		}
-		builder.AppendLine($"}} & {{ }}");
-		builder.AppendLine($"declare Enums: ENUM_LIST");
+		builder.AppendLine("} & { }");
+		builder.AppendLine("declare Enums: ENUM_LIST");
 
 		foreach (ScriptClass item in refer.Classes)
 		{
@@ -129,7 +129,7 @@ public class LuaDefinitionGenerator
 		bool hasStatic = false;
 
 		string baseType = c.BaseType != null ? $" extends {c.BaseType}" : "";
-		builder.AppendLine($"declare class {c.Name}{baseType}");
+		builder.AppendLine($"declare extern type {c.Name}{baseType} with");
 
 		foreach (ScriptProperty p in c.Properties)
 		{
@@ -174,7 +174,7 @@ public class LuaDefinitionGenerator
 			builder.AppendLine($"\tfunction {m.Name}({string.Join(", ", args)}): {ProcessType(m.ReturnType ?? "")}");
 		}
 
-		builder.AppendLine($"end");
+		builder.AppendLine("end");
 
 		if (hasStatic)
 		{
@@ -230,7 +230,7 @@ public class LuaDefinitionGenerator
 			builder.AppendLine($"\t{methodGroup.Key}: {methodType},");
 		}
 
-		builder.AppendLine($"}}");
+		builder.AppendLine("}");
 
 		return builder.ToString();
 	}
