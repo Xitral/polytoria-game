@@ -18,6 +18,8 @@ namespace Polytoria.Creator.LSP;
 
 public class LuaCompletionService(CreatorSession session)
 {
+	private const int CompletionDebounceMilliseconds = 75;
+
 	private readonly CreatorSession _session = session;
 	private readonly string _workspacePath = session.ProjectFolderPath;
 	private readonly SemaphoreSlim _lspGate = new(1, 1);
@@ -27,6 +29,7 @@ public class LuaCompletionService(CreatorSession session)
 	private FileSystemWatcher? _workspaceWatcher;
 	private readonly Dictionary<string, int> _versions = new(StringComparer.OrdinalIgnoreCase);
 	private readonly Dictionary<string, string> _lastSyncedContent = new(StringComparer.OrdinalIgnoreCase);
+	private readonly Dictionary<string, long> _completionGenerations = new(StringComparer.OrdinalIgnoreCase);
 	private readonly HashSet<World> _trackedWorlds = [];
 	private readonly List<World> _worldOrder = [];
 	private readonly HashSet<Instance> _trackedInstances = [];
@@ -278,6 +281,10 @@ public class LuaCompletionService(CreatorSession session)
 		{
 			_versions.Remove(scriptPath);
 			_lastSyncedContent.Remove(scriptPath);
+			lock (_stateLock)
+			{
+				_completionGenerations.Remove(scriptPath);
+			}
 			await _client.DidCloseAsync(scriptPath);
 		}
 		finally
@@ -579,26 +586,80 @@ public class LuaCompletionService(CreatorSession session)
 		}
 	}
 
+	private long BeginCompletionRequest(string scriptPath)
+	{
+		lock (_stateLock)
+		{
+			long generation = _completionGenerations.TryGetValue(scriptPath, out long current)
+				? current + 1
+				: 1;
+			_completionGenerations[scriptPath] = generation;
+			return generation;
+		}
+	}
+
+	private bool IsLatestCompletionRequest(string scriptPath, long generation)
+	{
+		lock (_stateLock)
+		{
+			return _completionGenerations.TryGetValue(scriptPath, out long current) && current == generation;
+		}
+	}
+
 	public async Task<List<CodeEditCompletionItem>> GetCompletionsAsync(CodeEditCompletionContext context, CancellationToken? cancelToken = null)
 	{
 		CancellationToken cancellationToken = cancelToken ?? CancellationToken.None;
-		await _lspGate.WaitAsync(cancellationToken);
+		long requestGeneration = BeginCompletionRequest(context.ScriptPath);
 
 		try
 		{
-			// Keep the exact in-memory source synchronized before taking a snapshot for
-			// a possible language-server refresh.
-			await UpdateScriptChangeCoreAsync(context.ScriptPath, context.Content);
+			await Task.Delay(CompletionDebounceMilliseconds, cancellationToken);
+		}
+		catch (OperationCanceledException)
+		{
+			return [];
+		}
+
+		if (!IsLatestCompletionRequest(context.ScriptPath, requestGeneration))
+		{
+			return [];
+		}
+
+		await _lspGate.WaitAsync(cancellationToken);
+		try
+		{
+			if (!IsLatestCompletionRequest(context.ScriptPath, requestGeneration))
+			{
+				return [];
+			}
+
+			// Text changes are synchronized by TextEditorRoot before it asks for
+			// completion. Never let an older queued completion snapshot overwrite a
+			// newer editor buffer, which previously caused require paths to oscillate
+			// and repeatedly reopen the same document after a module move.
+			if (_lastSyncedContent.TryGetValue(context.ScriptPath, out string? latestContent))
+			{
+				if (!string.Equals(latestContent, context.Content, StringComparison.Ordinal))
+				{
+					return [];
+				}
+			}
+			else
+			{
+				await UpdateScriptChangeCoreAsync(context.ScriptPath, context.Content);
+			}
 
 			SynchronizeTrackedWorlds();
 			FlushModuleMapIfDirty();
 
-			// Module file watcher events and hierarchy changes are coalesced. The
-			// ordinary completion path performs no world traversal, timestamp scan, or
-			// map rebuild unless an actual relevant change marked the index dirty.
 			if (TakeLanguageServerRefreshPending())
 			{
 				await RestartLanguageServerCoreAsync();
+			}
+
+			if (!IsLatestCompletionRequest(context.ScriptPath, requestGeneration))
+			{
+				return [];
 			}
 
 			LspCompletionItem[]? completionResult = await _client.RequestCompletionAsync(
@@ -606,6 +667,11 @@ public class LuaCompletionService(CreatorSession session)
 				context.CursorLine,
 				context.CursorColumn,
 				cancellationToken);
+
+			if (!IsLatestCompletionRequest(context.ScriptPath, requestGeneration))
+			{
+				return [];
+			}
 
 			List<CodeEditCompletionItem> items = [];
 
