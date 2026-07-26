@@ -15,6 +15,8 @@ namespace Polytoria.Creator.LSP;
 
 public class LspClient(Stream input, Stream output) : LspClientBase(input, output)
 {
+	private const string DefinitionFilePath = "./.poly/luau/def.d.luau";
+
 	private static readonly string[] PluginPaths =
 	[
 		"./.poly/luau/polytoria-require.luau",
@@ -169,6 +171,17 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 			{
 				["type"] = "standard"
 			},
+			["types"] = new Dictionary<string, object>
+			{
+				// The language server is also started with --definitions, but a later
+				// workspace/configuration response replaces its client configuration.
+				// Keep the generated Polytoria API definitions in that response so global
+				// values and types such as Vector and Instance remain available.
+				["definitionFiles"] = new Dictionary<string, string>
+				{
+					["@poly"] = DefinitionFilePath
+				}
+			},
 			["completion"] = new Dictionary<string, object>
 			{
 				// Fragment autocomplete reuses the previous dependency graph. A source
@@ -209,7 +222,7 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 					configurations[index] = CreateLuauConfiguration();
 				}
 
-				PT.Print("Luau LSP requested ", configurationCount, " configuration entries; enabling ", PluginPaths.Length, " Polytoria plugins");
+				PT.Print("Luau LSP requested ", configurationCount, " configuration entries; enabling ", PluginPaths.Length, " Polytoria plugins and definitions");
 
 				await WriteMessageAsync(new LspResponse
 				{
