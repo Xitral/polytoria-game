@@ -3,6 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 using Polytoria.Creator.LSP;
+using Polytoria.Creator.LSP.Schemas;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -117,6 +118,7 @@ public class LuauToolboxModuleIntellisenseTest
 					if (!process.HasExited)
 					{
 						process.Kill(entireProcessTree: true);
+						process.WaitForExit(5000);
 					}
 				}
 				catch (InvalidOperationException)
