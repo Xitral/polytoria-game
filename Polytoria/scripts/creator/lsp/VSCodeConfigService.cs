@@ -155,7 +155,8 @@ public static class VSCodeConfigService
 			}
 		}
 
-		array.Add(JsonValue.Create(value));
+		JsonNode? node = JsonValue.Create(value);
+		array.Add(node);
 	}
 
 	private static void WriteObject(string path, JsonObject value)
