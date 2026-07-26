@@ -19,7 +19,9 @@ public class LuaCompletionService(CreatorSession session)
 	private readonly string _workspacePath = session.ProjectFolderPath;
 	private Process _luaLSProcess = null!;
 	private LspClient _client = null!;
-	private readonly Dictionary<string, int> _versions = [];
+	private readonly Dictionary<string, int> _versions = new(StringComparer.OrdinalIgnoreCase);
+	private readonly Dictionary<string, string> _lastSyncedContent = new(StringComparer.OrdinalIgnoreCase);
+	private readonly HashSet<string> _reportedInternalSources = new(StringComparer.OrdinalIgnoreCase);
 
 	public event Action<string, List<LspDiagnostic>>? PublishDiagnostics;
 
@@ -94,29 +96,45 @@ public class LuaCompletionService(CreatorSession session)
 	public async Task OpenScriptAsync(string scriptPath)
 	{
 		string content = File.ReadAllText(scriptPath);
+		_versions[scriptPath] = 1;
+		_lastSyncedContent[scriptPath] = content;
 		await _client.DidOpenAsync(scriptPath, "luau", content);
 	}
 
 	public async Task CloseScriptAsync(string scriptPath)
 	{
 		_versions.Remove(scriptPath);
+		_lastSyncedContent.Remove(scriptPath);
+		_reportedInternalSources.Remove(scriptPath);
 		await _client.DidCloseAsync(scriptPath);
 	}
 
 	public async Task UpdateScriptChangeAsync(string scriptPath, string scriptContent)
 	{
-		if (!_versions.ContainsKey(scriptPath)) _versions[scriptPath] = 1;
-		_versions[scriptPath]++;
-		await _client.DidChangeAsync(scriptPath, scriptContent, _versions[scriptPath]);
+		if (_lastSyncedContent.TryGetValue(scriptPath, out string? previousContent) && previousContent == scriptContent)
+		{
+			return;
+		}
+
+		int version = _versions.TryGetValue(scriptPath, out int currentVersion) ? currentVersion + 1 : 2;
+		_versions[scriptPath] = version;
+		_lastSyncedContent[scriptPath] = scriptContent;
+		await _client.DidChangeAsync(scriptPath, scriptContent, version);
 	}
 
 	public async Task<List<CodeEditCompletionItem>> GetCompletionsAsync(CodeEditCompletionContext context, CancellationToken? cancelToken = null)
 	{
+		CancellationToken cancellationToken = cancelToken ?? CancellationToken.None;
+
+		// CodeEdit can request completion before its TextChanged callback finishes.
+		// Synchronize the exact in-memory buffer before asking the language server.
+		await UpdateScriptChangeAsync(context.ScriptPath, context.Content);
+
 		LspCompletionItem[]? completionResult = await _client.RequestCompletionAsync(
 			context.ScriptPath,
 			context.CursorLine,
 			context.CursorColumn,
-			cancelToken ?? CancellationToken.None);
+			cancellationToken);
 
 		List<CodeEditCompletionItem> items = [];
 
@@ -146,6 +164,23 @@ public class LuaCompletionService(CreatorSession session)
 					Detail = item.Detail ?? "",
 					InsertText = string.IsNullOrWhiteSpace(item.InsertText) ? item.Label ?? "" : item.InsertText
 				});
+			}
+		}
+
+		// Temporary proof-of-concept diagnostic. This confirms whether the plugin
+		// transformed the source that Creator actually sent to Luau LSP.
+		if (items.Count == 0 &&
+			context.Content.Contains("world.ScriptService.MathUtil", StringComparison.Ordinal) &&
+			_reportedInternalSources.Add(context.ScriptPath))
+		{
+			try
+			{
+				string? internalSource = await _client.RequestInternalSourceAsync(context.ScriptPath, cancellationToken);
+				PT.Print("Luau LSP internal source for ", context.ScriptPath, ":\n", internalSource ?? "<null>");
+			}
+			catch (Exception ex)
+			{
+				PT.PrintErr("Failed to read Luau LSP internal source: ", ex.Message);
 			}
 		}
 
