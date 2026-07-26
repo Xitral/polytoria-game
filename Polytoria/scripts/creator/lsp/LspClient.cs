@@ -16,7 +16,11 @@ namespace Polytoria.Creator.LSP;
 
 public class LspClient(Stream input, Stream output) : LspClientBase(input, output)
 {
-	private const string RequirePluginPath = "./.poly/luau/polytoria-require.luau";
+	private static readonly string[] PluginPaths =
+	[
+		"./.poly/luau/polytoria-require.luau",
+		"./.poly/luau/polytoria-module-types.luau"
+	];
 
 	public readonly Dictionary<string, string> LspPathToFull = new(StringComparer.OrdinalIgnoreCase);
 	public readonly Dictionary<string, string> FullToLspPath = new(StringComparer.OrdinalIgnoreCase);
@@ -177,7 +181,7 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 			["plugins"] = new Dictionary<string, object>
 			{
 				["enabled"] = true,
-				["paths"] = new[] { RequirePluginPath },
+				["paths"] = PluginPaths,
 				["fileSystem"] = new Dictionary<string, object>
 				{
 					["enabled"] = true
@@ -207,7 +211,7 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 					configurations[i] = CreateLuauConfiguration();
 				}
 
-				PT.Print("Luau LSP requested ", configurationCount, " configuration entries; enabling require plugin at ", RequirePluginPath);
+				PT.Print("Luau LSP requested ", configurationCount, " configuration entries; enabling ", PluginPaths.Length, " Polytoria plugins");
 
 				LspResponse response = new()
 				{
