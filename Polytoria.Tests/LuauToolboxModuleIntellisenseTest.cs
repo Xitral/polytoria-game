@@ -19,6 +19,7 @@ public class LuauToolboxModuleIntellisenseTest
 	[Fact]
 	public async Task ToolboxModuleExportsAreInferredBeforeModuleMapExists()
 	{
+		CancellationToken testCancellation = TestContext.Current.CancellationToken;
 		string repositoryRoot = FindRepositoryRoot();
 		string workspacePath = Path.Join(Path.GetTempPath(), "polytoria-toolbox-lsp-" + Guid.NewGuid().ToString("N"));
 		Directory.CreateDirectory(workspacePath);
@@ -67,7 +68,7 @@ public class LuauToolboxModuleIntellisenseTest
 			File.WriteAllText(serverPath, serverSource);
 
 			process = StartLanguageServer(repositoryRoot, workspacePath);
-			_ = process.StandardError.ReadToEndAsync();
+			_ = process.StandardError.ReadToEndAsync(testCancellation);
 
 			client = new LspClient(process.StandardOutput.BaseStream, process.StandardInput.BaseStream);
 			await client.InitializeAsync(workspacePath);
@@ -75,7 +76,8 @@ public class LuauToolboxModuleIntellisenseTest
 			await client.DidOpenAsync(serverPath, "luau", serverSource);
 
 			HashSet<string> labels = [];
-			using CancellationTokenSource timeout = new(TimeSpan.FromSeconds(15));
+			using CancellationTokenSource timeout = CancellationTokenSource.CreateLinkedTokenSource(testCancellation);
+			timeout.CancelAfter(TimeSpan.FromSeconds(15));
 
 			while (!timeout.IsCancellationRequested)
 			{
@@ -96,13 +98,13 @@ public class LuauToolboxModuleIntellisenseTest
 					{
 						break;
 					}
+
+					await Task.Delay(200, timeout.Token);
 				}
 				catch (OperationCanceledException) when (timeout.IsCancellationRequested)
 				{
 					break;
 				}
-
-				await Task.Delay(200, timeout.Token).ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
 			}
 
 			Assert.Contains("New", labels);
