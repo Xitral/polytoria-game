@@ -16,12 +16,12 @@ namespace Polytoria.Creator.LSP;
 
 public class LuaCompletionService(CreatorSession session)
 {
+	private readonly CreatorSession _session = session;
 	private readonly string _workspacePath = session.ProjectFolderPath;
 	private Process _luaLSProcess = null!;
 	private LspClient _client = null!;
 	private readonly Dictionary<string, int> _versions = new(StringComparer.OrdinalIgnoreCase);
 	private readonly Dictionary<string, string> _lastSyncedContent = new(StringComparer.OrdinalIgnoreCase);
-	private readonly HashSet<string> _reportedInternalSources = new(StringComparer.OrdinalIgnoreCase);
 
 	public event Action<string, List<LspDiagnostic>>? PublishDiagnostics;
 
@@ -36,6 +36,8 @@ public class LuaCompletionService(CreatorSession session)
 
 	public async Task InitAsync()
 	{
+		LuauModuleMapService.Generate(_session);
+
 		ProcessStartInfo processStartInfo = new()
 		{
 			FileName = NativeBinHelper.ResolveLuauLspBinPath(),
@@ -75,7 +77,6 @@ public class LuaCompletionService(CreatorSession session)
 		string normalizedUri = new Uri(@params.Uri).AbsoluteUri;
 		if (_client.LspPathToFull.TryGetValue(normalizedUri, out string? fullPath))
 		{
-			// Call publish in main thread
 			Callable.From(() =>
 			{
 				PublishDiagnostics?.Invoke(fullPath, @params.Diagnostics);
@@ -95,6 +96,8 @@ public class LuaCompletionService(CreatorSession session)
 
 	public async Task OpenScriptAsync(string scriptPath)
 	{
+		LuauModuleMapService.Generate(_session);
+
 		string content = File.ReadAllText(scriptPath);
 		_versions[scriptPath] = 1;
 		_lastSyncedContent[scriptPath] = content;
@@ -105,13 +108,14 @@ public class LuaCompletionService(CreatorSession session)
 	{
 		_versions.Remove(scriptPath);
 		_lastSyncedContent.Remove(scriptPath);
-		_reportedInternalSources.Remove(scriptPath);
 		await _client.DidCloseAsync(scriptPath);
 	}
 
-	public async Task UpdateScriptChangeAsync(string scriptPath, string scriptContent)
+	public async Task UpdateScriptChangeAsync(string scriptPath, string scriptContent, bool force = false)
 	{
-		if (_lastSyncedContent.TryGetValue(scriptPath, out string? previousContent) && previousContent == scriptContent)
+		if (!force &&
+			_lastSyncedContent.TryGetValue(scriptPath, out string? previousContent) &&
+			previousContent == scriptContent)
 		{
 			return;
 		}
@@ -126,9 +130,13 @@ public class LuaCompletionService(CreatorSession session)
 	{
 		CancellationToken cancellationToken = cancelToken ?? CancellationToken.None;
 
-		// CodeEdit can request completion before its TextChanged callback finishes.
-		// Synchronize the exact in-memory buffer before asking the language server.
-		await UpdateScriptChangeAsync(context.ScriptPath, context.Content);
+		// Rebuild from the live DataModel so renames, reparenting, relinking, and
+		// scripts located outside ScriptService are reflected immediately.
+		bool moduleMapChanged = LuauModuleMapService.Generate(_session);
+
+		// Synchronize the exact in-memory buffer. When the map changed, sending the
+		// same source at a new version also invalidates Luau LSP's transformed cache.
+		await UpdateScriptChangeAsync(context.ScriptPath, context.Content, moduleMapChanged);
 
 		LspCompletionItem[]? completionResult = await _client.RequestCompletionAsync(
 			context.ScriptPath,
@@ -144,16 +152,16 @@ public class LuaCompletionService(CreatorSession session)
 			{
 				CodeEdit.CodeCompletionKind kind = item.Kind switch
 				{
-					9 => CodeEdit.CodeCompletionKind.Function, // Method
-					3 => CodeEdit.CodeCompletionKind.Function, // Function
-					21 => CodeEdit.CodeCompletionKind.Constant, // Constant
-					7 => CodeEdit.CodeCompletionKind.Class, // Class
-					13 => CodeEdit.CodeCompletionKind.Enum, // Enum
-					6 => CodeEdit.CodeCompletionKind.Variable, // Variable
-					20 => CodeEdit.CodeCompletionKind.Member, // EnumMember
-					10 => CodeEdit.CodeCompletionKind.Member, // Property
-					5 => CodeEdit.CodeCompletionKind.Member, // Field
-					14 => CodeEdit.CodeCompletionKind.PlainText, // Keyword
+					9 => CodeEdit.CodeCompletionKind.Function,
+					3 => CodeEdit.CodeCompletionKind.Function,
+					21 => CodeEdit.CodeCompletionKind.Constant,
+					7 => CodeEdit.CodeCompletionKind.Class,
+					13 => CodeEdit.CodeCompletionKind.Enum,
+					6 => CodeEdit.CodeCompletionKind.Variable,
+					20 => CodeEdit.CodeCompletionKind.Member,
+					10 => CodeEdit.CodeCompletionKind.Member,
+					5 => CodeEdit.CodeCompletionKind.Member,
+					14 => CodeEdit.CodeCompletionKind.PlainText,
 					_ => CodeEdit.CodeCompletionKind.PlainText,
 				};
 
@@ -164,23 +172,6 @@ public class LuaCompletionService(CreatorSession session)
 					Detail = item.Detail ?? "",
 					InsertText = string.IsNullOrWhiteSpace(item.InsertText) ? item.Label ?? "" : item.InsertText
 				});
-			}
-		}
-
-		// Temporary proof-of-concept diagnostic. This confirms whether the plugin
-		// transformed the source that Creator actually sent to Luau LSP.
-		if (items.Count == 0 &&
-			context.Content.Contains("world.ScriptService.MathUtil", StringComparison.Ordinal) &&
-			_reportedInternalSources.Add(context.ScriptPath))
-		{
-			try
-			{
-				string? internalSource = await _client.RequestInternalSourceAsync(context.ScriptPath, cancellationToken);
-				PT.Print("Luau LSP internal source for ", context.ScriptPath, ":\n", internalSource ?? "<null>");
-			}
-			catch (Exception ex)
-			{
-				PT.PrintErr("Failed to read Luau LSP internal source: ", ex.Message);
 			}
 		}
 
