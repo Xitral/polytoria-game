@@ -42,14 +42,25 @@ public static class LuauModuleMapService
 			}
 		}
 
-		return Generate(session, scripts);
+		return Generate(session, scripts, out _);
 	}
 
 	/// <summary>
 	/// Rebuilds the map from an already maintained script index and returns true
-	/// when the generated contents changed.
+	/// when the on-disk generated contents changed.
 	/// </summary>
 	public static bool Generate(CreatorSession session, IEnumerable<Script> scripts)
+	{
+		return Generate(session, scripts, out _);
+	}
+
+	/// <summary>
+	/// Rebuilds the map and also returns the complete generated snapshot. Each
+	/// language-server client must compare this snapshot with the last map it
+	/// personally applied instead of relying only on whether another service has
+	/// already written the same contents to disk.
+	/// </summary>
+	public static bool Generate(CreatorSession session, IEnumerable<Script> scripts, out string generatedContent)
 	{
 		// The external-editor synchronizer activates only while VS Code is selected.
 		// Built-in Creator completion keeps using its own event-driven index.
@@ -92,14 +103,14 @@ public static class LuauModuleMapService
 			output.AppendLine(row);
 		}
 
+		generatedContent = output.ToString();
 		string mapPath = Path.Join(mapDirectory, MapFileName);
-		string newContent = output.ToString();
-		if (File.Exists(mapPath) && File.ReadAllText(mapPath) == newContent)
+		if (File.Exists(mapPath) && File.ReadAllText(mapPath) == generatedContent)
 		{
 			return false;
 		}
 
-		File.WriteAllText(mapPath, newContent);
+		File.WriteAllText(mapPath, generatedContent);
 		return true;
 	}
 
