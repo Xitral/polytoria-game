@@ -18,7 +18,6 @@ public class LuauModuleMoveIntellisenseTest
 		CancellationToken testCancellation = TestContext.Current.CancellationToken;
 		using LuauLspTestWorkspace workspace = new("polytoria-module-move-lsp");
 
-		string mapPath = workspace.GetPath($".poly/luau/{LuauModuleMapService.MapFileName}");
 		string initialModuleSource = """
 			local MathUtil = {}
 			MathUtil.Version = "1.0"
