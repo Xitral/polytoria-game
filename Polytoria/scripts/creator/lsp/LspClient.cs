@@ -176,6 +176,13 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 			{
 				["type"] = "standard"
 			},
+			["completion"] = new Dictionary<string, object>
+			{
+				// Fragment autocomplete can return an empty successful result for
+				// plugin-transformed managed documents before the full type graph is rebuilt.
+				// Force the normal strict completion path for reliable module inference.
+				["enableFragmentAutocomplete"] = false
+			},
 			["plugins"] = new Dictionary<string, object>
 			{
 				["enabled"] = true,
