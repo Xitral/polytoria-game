@@ -71,12 +71,25 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 
 		await SendRequestAsync<LspInitializeResult>("initialize", initParams);
 		await SendNotificationAsync("initialized", new EmptyParams());
+
+		// The initialize response only confirms the JSON-RPC handshake. Luau LSP
+		// loads configuration, definitions, plugins, and workspace files afterward.
+		// Do not allow callers to request completions against that half-initialized
+		// workspace, which otherwise produces a one-off empty result after restarts.
+		using CancellationTokenSource readinessTimeout = new(TimeSpan.FromSeconds(30));
+		try
+		{
+			await WaitUntilWorkspaceReadyAsync(readinessTimeout.Token);
+		}
+		catch (OperationCanceledException)
+		{
+			PT.PrintWarn("Timed out waiting for Luau LSP workspace indexing; continuing with partial language-server state");
+		}
 	}
 
 	/// <summary>
 	/// Completes after Luau LSP has loaded configuration/plugins and finished its
-	/// initial workspace index. InitializeAsync alone only completes the JSON-RPC
-	/// handshake and is too early for reliable module completion requests.
+	/// initial workspace index.
 	/// </summary>
 	public Task WaitUntilWorkspaceReadyAsync(CancellationToken cancellationToken = default)
 	{
