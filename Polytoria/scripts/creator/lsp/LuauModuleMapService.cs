@@ -51,6 +51,10 @@ public static class LuauModuleMapService
 	/// </summary>
 	public static bool Generate(CreatorSession session, IEnumerable<Script> scripts)
 	{
+		// Creator and external VS Code sessions must use the same definitions,
+		// plugins, filesystem permission, and full-typecheck completion mode.
+		VSCodeConfigService.Ensure(session.ProjectFolderPath);
+
 		string mapDirectory = Path.Join(session.PolyFolderPath, "luau");
 		Directory.CreateDirectory(mapDirectory);
 
