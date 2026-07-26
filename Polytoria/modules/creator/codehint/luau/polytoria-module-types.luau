@@ -1,7 +1,9 @@
 local MAP_FILE_NAME = "polytoria-module-map.tsv"
+local TOOLBOX_FOLDER_NAME = "toolbox"
 
 local function normalizePath(path: string): string
 	local normalized = string.gsub(path, "\\", "/")
+	normalized = string.gsub(normalized, "^/+", "")
 	normalized = string.gsub(normalized, "/+$", "")
 	return normalized
 end
@@ -33,6 +35,17 @@ local function hasExplicitLanguageMode(source: string): boolean
 		or trimmed == "--!nocheck"
 end
 
+local function isToolboxSource(context: PluginContext): boolean
+	local sourceFile = getProjectRelativePath(context)
+	if sourceFile == nil then
+		return false
+	end
+
+	local sourceKey = string.lower(normalizePath(sourceFile))
+	local toolboxKey = string.lower(TOOLBOX_FOLDER_NAME)
+	return sourceKey == toolboxKey or string.sub(sourceKey, 1, #toolboxKey + 1) == toolboxKey .. "/"
+end
+
 local function isMappedModule(context: PluginContext): boolean
 	local sourceFile = getProjectRelativePath(context)
 	if sourceFile == nil then
@@ -62,13 +75,21 @@ end
 
 return {
 	transformSource = function(source: string, context: PluginContext): { TextEdit }?
-		if hasExplicitLanguageMode(source) or not isMappedModule(context) then
+		if hasExplicitLanguageMode(source) then
+			return nil
+		end
+
+		-- Toolbox imports are written into the project's toolbox folder before the
+		-- world-to-file module map is necessarily synchronized with every language
+		-- server client. Treat those files as analyzable immediately so large imported
+		-- ModuleScripts do not remain in the project's default nocheck mode.
+		if not isToolboxSource(context) and not isMappedModule(context) then
 			return nil
 		end
 
 		-- Creator projects currently default to nocheck, which disables Luau's type
-		-- inference engine. Analyze linked ModuleScripts as nonstrict so their returned
-		-- table shape is available to require() autocomplete without changing runtime code.
+		-- inference engine. Analyze ModuleScripts as nonstrict so their returned table
+		-- shape is available to require() autocomplete without changing runtime code.
 		return {
 			{
 				startLine = 1,
