@@ -15,13 +15,13 @@ namespace Polytoria.Creator.LSP;
 
 public class LspClient(Stream input, Stream output) : LspClientBase(input, output)
 {
-	private const string DefinitionFilePath = "./.poly/luau/def.d.luau";
-
 	private static readonly string[] PluginPaths =
 	[
 		"./.poly/luau/polytoria-require.luau",
 		"./.poly/luau/polytoria-module-types.luau"
 	];
+
+	private string _definitionFilePath = "";
 
 	public readonly Dictionary<string, string> LspPathToFull = new(StringComparer.OrdinalIgnoreCase);
 	public readonly Dictionary<string, string> FullToLspPath = new(StringComparer.OrdinalIgnoreCase);
@@ -29,6 +29,8 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 
 	public async Task InitializeAsync(string workspacePath)
 	{
+		_definitionFilePath = Path.GetFullPath(Path.Join(workspacePath, ".poly", "luau", "def.d.luau"));
+
 		LspInitializeParams initParams = new()
 		{
 			RootUri = LspHelper.PathToUri(workspacePath),
@@ -163,7 +165,7 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 		}
 	}
 
-	private static Dictionary<string, object> CreateLuauConfiguration()
+	private Dictionary<string, object> CreateLuauConfiguration()
 	{
 		return new()
 		{
@@ -173,13 +175,12 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 			},
 			["types"] = new Dictionary<string, object>
 			{
-				// The language server is also started with --definitions, but a later
-				// workspace/configuration response replaces its client configuration.
-				// Keep the generated Polytoria API definitions in that response so global
-				// values and types such as Vector and Instance remain available.
+				// workspace/configuration may be requested for both the global scope and
+				// the workspace folder. Use an absolute path so either configuration loads
+				// the generated Polytoria API definitions from the correct project.
 				["definitionFiles"] = new Dictionary<string, object>
 				{
-					["@poly"] = DefinitionFilePath
+					["@poly"] = _definitionFilePath
 				}
 			},
 			["completion"] = new Dictionary<string, object>
