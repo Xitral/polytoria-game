@@ -160,6 +160,12 @@ public static class VSCodeConfigService
 
 	private static void WriteObject(string path, JsonObject value)
 	{
-		File.WriteAllText(path, value.ToJsonString(SerializerOptions) + Environment.NewLine);
+		string content = value.ToJsonString(SerializerOptions) + Environment.NewLine;
+		if (File.Exists(path) && string.Equals(File.ReadAllText(path), content, StringComparison.Ordinal))
+		{
+			return;
+		}
+
+		File.WriteAllText(path, content);
 	}
 }
