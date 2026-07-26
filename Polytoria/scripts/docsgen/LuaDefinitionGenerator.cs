@@ -81,7 +81,7 @@ public class LuaDefinitionGenerator
 			{
 				builder.AppendLine($"\t{item}:{e.Name}");
 			}
-			builder.AppendLine("end");
+			builder.AppendLine($"end");
 		}
 
 		builder.AppendLine($"type ENUM_LIST = {{");
@@ -170,10 +170,11 @@ public class LuaDefinitionGenerator
 
 			if (!m.IsSemiStatic) { args.Insert(0, "self"); }
 			else { args[0] = "self"; }
+
 			builder.AppendLine($"\tfunction {m.Name}({string.Join(", ", args)}): {ProcessType(m.ReturnType ?? "")}");
 		}
 
-		builder.AppendLine("end");
+		builder.AppendLine($"end");
 
 		if (hasStatic)
 		{
@@ -181,5 +182,52 @@ public class LuaDefinitionGenerator
 		}
 
 		return builder.ToString();
+	}
+
+	public static string GenerateStaticClass(ScriptClass c)
+	{
+		StringBuilder builder = new();
+
+		builder.AppendLine($"declare {c.Name}: {{");
+
+		foreach (ScriptProperty p in c.Properties)
+		{
+			if (!p.IsStatic) continue;
+			builder.AppendLine($"\t{p.Name} : {ProcessType(p.Type ?? "nil")},");
+		}
+
+		foreach (ScriptMethod m in c.Methods)
+		{
+			if (m.IsObsolete) continue;
+			if (!m.IsStatic) continue;
+			// Ignore metamethods
+			if (m.Name.StartsWith("__")) continue;
+			List<string> args = [];
+
+			foreach (ScriptParameter param in m.Parameters)
+			{
+				if (param.Type == null) continue;
+				args.Add($"{ProcessType(param.Type) + (param.IsOptional ? "?" : "")}");
+			}
+
+			builder.AppendLine($"{m.Name}: ({string.Join(", ", args)}) -> ({ProcessType(m.ReturnType ?? "")}),");
+		}
+
+		builder.AppendLine($"}}");
+
+		return builder.ToString();
+	}
+
+	private static string ProcessType(string t)
+	{
+		if (t == "function")
+		{
+			return "() -> nil";
+		}
+		else if (t == "table")
+		{
+			return "{ any }";
+		}
+		return t;
 	}
 }
