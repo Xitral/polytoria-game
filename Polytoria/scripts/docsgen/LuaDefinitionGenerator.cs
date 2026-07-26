@@ -196,21 +196,38 @@ public class LuaDefinitionGenerator
 			builder.AppendLine($"\t{p.Name} : {ProcessType(p.Type ?? "nil")},");
 		}
 
-		foreach (ScriptMethod m in c.Methods)
-		{
-			if (m.IsObsolete) continue;
-			if (!m.IsStatic) continue;
-			// Ignore metamethods
-			if (m.Name.StartsWith("__")) continue;
-			List<string> args = [];
+		IEnumerable<IGrouping<string, ScriptMethod>> methodGroups = c.Methods
+			.Where(method => !method.IsObsolete && method.IsStatic && !method.Name.StartsWith("__"))
+			.GroupBy(method => method.Name);
 
-			foreach (ScriptParameter param in m.Parameters)
+		foreach (IGrouping<string, ScriptMethod> methodGroup in methodGroups)
+		{
+			List<string> overloads = [];
+
+			foreach (ScriptMethod method in methodGroup)
 			{
-				if (param.Type == null) continue;
-				args.Add($"{ProcessType(param.Type) + (param.IsOptional ? "?" : "")}");
+				List<string> args = [];
+
+				foreach (ScriptParameter parameter in method.Parameters)
+				{
+					if (parameter.Type == null) continue;
+					args.Add(ProcessType(parameter.Type) + (parameter.IsOptional ? "?" : ""));
+				}
+
+				string signature = $"({string.Join(", ", args)}) -> ({ProcessType(method.ReturnType ?? "")})";
+				if (!overloads.Contains(signature))
+				{
+					overloads.Add(signature);
+				}
 			}
 
-			builder.AppendLine($"{m.Name}: ({string.Join(", ", args)}) -> ({ProcessType(m.ReturnType ?? "")}),");
+			if (overloads.Count == 0) continue;
+
+			string methodType = overloads.Count == 1
+				? overloads[0]
+				: string.Join(" & ", overloads.Select(overload => $"({overload})"));
+
+			builder.AppendLine($"\t{methodGroup.Key}: {methodType},");
 		}
 
 		builder.AppendLine($"}}");
