@@ -11,23 +11,49 @@ namespace Polytoria.Tests;
 public class LuauToolboxModuleIntellisenseTest
 {
 	[Fact]
-	public async Task ToolboxModuleExportsAreInferredBeforeModuleMapExists()
+	public async Task ToolboxModuleExportsRemainAvailableWithNativeDefinitions()
 	{
 		CancellationToken testCancellation = TestContext.Current.CancellationToken;
 		using LuauLspTestWorkspace workspace = new("polytoria-toolbox-lsp");
 
+		workspace.WriteFile(".poly/luau/def.d.luau", """
+			declare extern type Vector3 with
+				x: number
+				y: number
+				z: number
+				sqrMagnitude: number
+			end
+
+			declare Vector3: {
+				New: (number, number, number) -> Vector3,
+				Normalize: (Vector3) -> Vector3,
+				Dot: (Vector3, Vector3) -> number,
+				Cross: (Vector3, Vector3) -> Vector3,
+			}
+			""");
+
 		// The module map intentionally does not exist yet. Toolbox files must still
-		// be analyzed as nonstrict during their first workspace index.
+		// expose their returned table while the native API definitions are active.
 		string moduleSource = """
 			local CFrame = {}
 			CFrame.Version = "V1.22"
+			CFrame.identity = {}
+
+			local function normalize(value)
+				return Vector3.Normalize(value)
+			end
 
 			function CFrame.New(value)
-				return value
+				return normalize(value)
 			end
 
 			function CFrame.lookAt(at, target)
-				return at, target
+				local direction = Vector3.New(target.x - at.x, target.y - at.y, target.z - at.z)
+				return Vector3.Normalize(direction)
+			end
+
+			CFrame.fromPosition = function(value)
+				return CFrame.New(value)
 			end
 
 			return CFrame
@@ -51,11 +77,17 @@ public class LuauToolboxModuleIntellisenseTest
 			serverPath,
 			1,
 			"CFrameUtil.".Length,
-			labels => labels.Contains("New") && labels.Contains("Version") && labels.Contains("lookAt"),
+			labels => labels.Contains("New") &&
+				labels.Contains("Version") &&
+				labels.Contains("identity") &&
+				labels.Contains("lookAt") &&
+				labels.Contains("fromPosition"),
 			testCancellation);
 
 		Assert.Contains("New", labels);
 		Assert.Contains("Version", labels);
+		Assert.Contains("identity", labels);
 		Assert.Contains("lookAt", labels);
+		Assert.Contains("fromPosition", labels);
 	}
 }
