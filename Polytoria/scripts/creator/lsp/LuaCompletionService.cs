@@ -4,6 +4,7 @@
 
 using Godot;
 using Polytoria.Creator.LSP.Schemas;
+using Polytoria.Datamodel;
 using Polytoria.Shared;
 using System;
 using System.Collections.Generic;
@@ -23,6 +24,7 @@ public class LuaCompletionService(CreatorSession session)
 	private readonly Dictionary<string, int> _versions = new(StringComparer.OrdinalIgnoreCase);
 	private readonly Dictionary<string, string> _lastSyncedContent = new(StringComparer.OrdinalIgnoreCase);
 	private readonly Dictionary<string, long> _lastDependencyRevision = new(StringComparer.OrdinalIgnoreCase);
+	private readonly Dictionary<string, ModuleFileState> _moduleFileStates = new(StringComparer.OrdinalIgnoreCase);
 	private long _moduleRevision;
 
 	public event Action<string, List<LspDiagnostic>>? PublishDiagnostics;
@@ -39,6 +41,7 @@ public class LuaCompletionService(CreatorSession session)
 	public async Task InitAsync()
 	{
 		LuauModuleMapService.Generate(_session);
+		RefreshModuleFileStates();
 
 		ProcessStartInfo processStartInfo = new()
 		{
@@ -98,7 +101,12 @@ public class LuaCompletionService(CreatorSession session)
 
 	public async Task OpenScriptAsync(string scriptPath)
 	{
-		LuauModuleMapService.Generate(_session);
+		bool moduleMapChanged = LuauModuleMapService.Generate(_session);
+		bool moduleFilesChanged = RefreshModuleFileStates();
+		if (moduleMapChanged && !moduleFilesChanged)
+		{
+			_moduleRevision++;
+		}
 
 		string content = File.ReadAllText(scriptPath);
 		_versions[scriptPath] = 1;
@@ -115,12 +123,10 @@ public class LuaCompletionService(CreatorSession session)
 		await _client.DidCloseAsync(scriptPath);
 	}
 
-	public async Task UpdateScriptChangeAsync(string scriptPath, string scriptContent, bool force = false)
+	public async Task UpdateScriptChangeAsync(string scriptPath, string scriptContent)
 	{
-		bool contentChanged = !_lastSyncedContent.TryGetValue(scriptPath, out string? previousContent) ||
-			previousContent != scriptContent;
-
-		if (!force && !contentChanged)
+		if (_lastSyncedContent.TryGetValue(scriptPath, out string? previousContent) &&
+			previousContent == scriptContent)
 		{
 			return;
 		}
@@ -129,14 +135,75 @@ public class LuaCompletionService(CreatorSession session)
 		_versions[scriptPath] = version;
 		_lastSyncedContent[scriptPath] = scriptContent;
 		await _client.DidChangeAsync(scriptPath, scriptContent, version);
+	}
 
-		// Luau LSP can retain completion results for scripts that require an edited
-		// module. Record a dependency revision so each requiring editor buffer is
-		// refreshed once before its next completion request.
-		if (contentChanged && LuauModuleMapService.IsLinkedModuleFile(_session, scriptPath))
+	private async Task ReopenScriptAsync(string scriptPath, string scriptContent)
+	{
+		await _client.DidCloseAsync(scriptPath);
+		await _client.DidOpenAsync(scriptPath, "luau", scriptContent);
+		_versions[scriptPath] = 1;
+		_lastSyncedContent[scriptPath] = scriptContent;
+	}
+
+	private bool RefreshModuleFileStates()
+	{
+		Dictionary<string, ModuleFileState> currentStates = new(StringComparer.OrdinalIgnoreCase);
+
+		foreach (World world in _session.OpenedWorlds)
+		{
+			foreach (Instance instance in world.GetDescendants())
+			{
+				if (instance is not ModuleScript module)
+				{
+					continue;
+				}
+
+				string? linkedPath = module.LinkedScript?.LinkedPath;
+				if (string.IsNullOrWhiteSpace(linkedPath))
+				{
+					continue;
+				}
+
+				string absolutePath = Path.IsPathRooted(linkedPath)
+					? Path.GetFullPath(linkedPath)
+					: Path.GetFullPath(Path.Join(_session.ProjectFolderPath, linkedPath));
+
+				if (!File.Exists(absolutePath))
+				{
+					continue;
+				}
+
+				FileInfo file = new(absolutePath);
+				currentStates[absolutePath] = new(file.LastWriteTimeUtc.Ticks, file.Length);
+			}
+		}
+
+		bool changed = currentStates.Count != _moduleFileStates.Count;
+		if (!changed)
+		{
+			foreach ((string path, ModuleFileState state) in currentStates)
+			{
+				if (!_moduleFileStates.TryGetValue(path, out ModuleFileState previousState) ||
+					previousState != state)
+				{
+					changed = true;
+					break;
+				}
+			}
+		}
+
+		_moduleFileStates.Clear();
+		foreach ((string path, ModuleFileState state) in currentStates)
+		{
+			_moduleFileStates[path] = state;
+		}
+
+		if (changed)
 		{
 			_moduleRevision++;
 		}
+
+		return changed;
 	}
 
 	public async Task<List<CodeEditCompletionItem>> GetCompletionsAsync(CodeEditCompletionContext context, CancellationToken? cancelToken = null)
@@ -146,19 +213,26 @@ public class LuaCompletionService(CreatorSession session)
 		// Rebuild from the live DataModel so renames, reparenting, relinking, and
 		// scripts located outside ScriptService are reflected immediately.
 		bool moduleMapChanged = LuauModuleMapService.Generate(_session);
+		bool moduleFilesChanged = RefreshModuleFileStates();
+		if (moduleMapChanged && !moduleFilesChanged)
+		{
+			_moduleRevision++;
+		}
+
+		await UpdateScriptChangeAsync(context.ScriptPath, context.Content);
 
 		long lastRevision = _lastDependencyRevision.TryGetValue(context.ScriptPath, out long revision)
 			? revision
 			: -1;
 		bool moduleDependencyChanged = lastRevision != _moduleRevision;
 
-		// Synchronize the exact in-memory buffer. A map change or edited module
-		// forces one fresh document version so Luau LSP rebuilds require inference.
-		await UpdateScriptChangeAsync(
-			context.ScriptPath,
-			context.Content,
-			moduleMapChanged || moduleDependencyChanged);
-		_lastDependencyRevision[context.ScriptPath] = _moduleRevision;
+		// Reopening is more reliable than sending an identical didChange notification.
+		// It guarantees that Luau LSP reruns both source transforms and module inference.
+		if (moduleDependencyChanged)
+		{
+			await ReopenScriptAsync(context.ScriptPath, context.Content);
+			_lastDependencyRevision[context.ScriptPath] = _moduleRevision;
+		}
 
 		LspCompletionItem[]? completionResult = await _client.RequestCompletionAsync(
 			context.ScriptPath,
@@ -199,6 +273,8 @@ public class LuaCompletionService(CreatorSession session)
 
 		return items;
 	}
+
+	private readonly record struct ModuleFileState(long LastWriteTicks, long Length);
 }
 
 public struct CodeEditCompletionItem
