@@ -22,6 +22,8 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 		"./.poly/luau/polytoria-module-types.luau"
 	];
 
+	private readonly TaskCompletionSource _workspaceReady = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
 	public readonly Dictionary<string, string> LspPathToFull = new(StringComparer.OrdinalIgnoreCase);
 	public readonly Dictionary<string, string> FullToLspPath = new(StringComparer.OrdinalIgnoreCase);
 	public event Action<LspPublishDiagnosticsParams>? PublishDiagnostics;
@@ -69,6 +71,16 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 
 		await SendRequestAsync<LspInitializeResult>("initialize", initParams);
 		await SendNotificationAsync("initialized", new EmptyParams());
+	}
+
+	/// <summary>
+	/// Completes after Luau LSP has loaded configuration/plugins and finished its
+	/// initial workspace index. InitializeAsync alone only completes the JSON-RPC
+	/// handshake and is too early for reliable module completion requests.
+	/// </summary>
+	public Task WaitUntilWorkspaceReadyAsync(CancellationToken cancellationToken = default)
+	{
+		return _workspaceReady.Task.WaitAsync(cancellationToken);
 	}
 
 	public Task DidOpenAsync(string path, string languageId, string text)
@@ -166,7 +178,15 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 			param.ValueKind == JsonValueKind.Object &&
 			param.TryGetProperty("message", out JsonElement message))
 		{
-			PT.Print("Luau LSP: ", message.GetString() ?? "");
+			string messageText = message.GetString() ?? "";
+			PT.Print("Luau LSP: ", messageText);
+
+			// This is emitted after configuration, definition files, plugins, and all
+			// workspace source files have been loaded and parsed.
+			if (messageText.StartsWith("Indexed ", StringComparison.Ordinal))
+			{
+				_workspaceReady.TrySetResult();
+			}
 		}
 	}
 
