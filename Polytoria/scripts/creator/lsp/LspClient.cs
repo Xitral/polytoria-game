@@ -9,6 +9,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -22,10 +23,15 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 		"./.poly/luau/polytoria-module-types.luau"
 	];
 
+	private static readonly Regex DirectModuleRequireRegex = new(
+		@"\brequire\s*\(\s*((?:world|script)(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_]*)+)\s*\)",
+		RegexOptions.CultureInvariant);
+
 	private readonly TaskCompletionSource _workspaceIndexed = new(TaskCreationOptions.RunContinuationsAsynchronously);
 	private readonly TaskCompletionSource _documentsReplayed = new(TaskCreationOptions.RunContinuationsAsynchronously);
 	private readonly SemaphoreSlim _documentStateGate = new(1, 1);
 	private readonly Dictionary<string, OpenDocument> _openDocuments = new(StringComparer.OrdinalIgnoreCase);
+	private readonly HashSet<string> _documentsNeedingTransformRefresh = new(StringComparer.OrdinalIgnoreCase);
 	private int _indexTimeoutReported;
 	private int _replayTimeoutReported;
 	private int _pluginReplayStarted;
@@ -123,6 +129,29 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 		}
 	}
 
+	private static string GetDirectModuleRequireSignature(string source)
+	{
+		if (!source.Contains("require", StringComparison.Ordinal))
+		{
+			return "";
+		}
+
+		StringBuilder signature = new();
+		foreach (Match match in DirectModuleRequireRegex.Matches(source))
+		{
+			foreach (char character in match.Groups[1].Value)
+			{
+				if (!char.IsWhiteSpace(character))
+				{
+					signature.Append(character);
+				}
+			}
+			signature.Append('\n');
+		}
+
+		return signature.ToString();
+	}
+
 	public async Task DidOpenAsync(string path, string languageId, string text)
 	{
 		await _documentStateGate.WaitAsync();
@@ -132,6 +161,7 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 			LspPathToFull[p] = path;
 			FullToLspPath[path] = p;
 			_openDocuments[path] = new OpenDocument(languageId, text, 1);
+			_documentsNeedingTransformRefresh.Remove(path);
 
 			await SendDidOpenNotificationAsync(path, languageId, text, 1);
 		}
@@ -147,6 +177,7 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 		try
 		{
 			_openDocuments.Remove(path);
+			_documentsNeedingTransformRefresh.Remove(path);
 			if (FullToLspPath.Remove(path, out string? p))
 			{
 				LspPathToFull.Remove(p);
@@ -165,10 +196,25 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 		await _documentStateGate.WaitAsync();
 		try
 		{
-			string languageId = _openDocuments.TryGetValue(path, out OpenDocument existing)
-				? existing.LanguageId
-				: "luau";
+			bool directRequireChanged = false;
+			string languageId = "luau";
+			if (_openDocuments.TryGetValue(path, out OpenDocument existing))
+			{
+				languageId = existing.LanguageId;
+				directRequireChanged = !string.Equals(
+					GetDirectModuleRequireSignature(existing.Text),
+					GetDirectModuleRequireSignature(text),
+					StringComparison.Ordinal);
+			}
+
 			_openDocuments[path] = new OpenDocument(languageId, text, version);
+			if (directRequireChanged)
+			{
+				// Luau LSP can retain the previous transformed require target after a
+				// world-path edit. Reopen this one document immediately before its next
+				// completion request so the plugin resolves against the current module map.
+				_documentsNeedingTransformRefresh.Add(path);
+			}
 
 			await SendNotificationAsync("textDocument/didChange", new LspDidChangeParams
 			{
@@ -220,6 +266,7 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 				await SendDidOpenNotificationAsync(path, document.LanguageId, document.Text, document.Version);
 			}
 
+			_documentsNeedingTransformRefresh.Clear();
 			if (documents.Length > 0)
 			{
 				PT.Print("Luau LSP reapplied plugins to ", documents.Length, " open script(s)");
@@ -244,10 +291,32 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 		}
 	}
 
+	private async Task RefreshDocumentTransformIfNeededAsync(string path)
+	{
+		await _documentStateGate.WaitAsync();
+		try
+		{
+			if (!_documentsNeedingTransformRefresh.Remove(path) ||
+				!_openDocuments.TryGetValue(path, out OpenDocument document))
+			{
+				return;
+			}
+
+			await SendDidCloseNotificationAsync(path);
+			await SendDidOpenNotificationAsync(path, document.LanguageId, document.Text, document.Version);
+			PT.Print("Luau LSP refreshed require transforms for ", path);
+		}
+		finally
+		{
+			_documentStateGate.Release();
+		}
+	}
+
 	public async Task<LspCompletionItem[]?> RequestCompletionAsync(string path, int line, int character, CancellationToken cancellationToken)
 	{
 		await WaitUntilWorkspaceIndexedAsync(cancellationToken);
 		await WaitUntilDocumentsReplayedAsync(cancellationToken);
+		await RefreshDocumentTransformIfNeededAsync(path);
 
 		JsonElement rawResult = await SendRequestAsync<JsonElement>("textDocument/completion", new LspCompletionParams
 		{
@@ -313,8 +382,6 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 
 			if (messageText.StartsWith("Indexed ", StringComparison.Ordinal))
 			{
-				// This also acts as a fallback if a future Luau LSP version changes the
-				// plugin summary wording.
 				StartDocumentReplayIfNeeded();
 				_workspaceIndexed.TrySetResult();
 			}
