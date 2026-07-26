@@ -177,7 +177,7 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 				// workspace/configuration response replaces its client configuration.
 				// Keep the generated Polytoria API definitions in that response so global
 				// values and types such as Vector and Instance remain available.
-				["definitionFiles"] = new Dictionary<string, string>
+				["definitionFiles"] = new Dictionary<string, object>
 				{
 					["@poly"] = DefinitionFilePath
 				}
