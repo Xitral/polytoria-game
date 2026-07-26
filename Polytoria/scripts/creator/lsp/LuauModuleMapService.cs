@@ -14,15 +14,16 @@ namespace Polytoria.Creator.LSP;
 
 /// <summary>
 /// Generates the project-local mapping consumed by the Luau LSP require plugin.
-/// Each entry associates a linked source file and its world location with every
-/// linked ModuleScript in the same world.
+/// Scripts and ModuleScripts may be linked anywhere in a world hierarchy and
+/// anywhere inside the project folder.
 /// </summary>
 public static class LuauModuleMapService
 {
 	public const string MapFileName = "polytoria-module-map.tsv";
 
-	private const string Header = "# Polytoria Luau module map v1\n" +
-		"# source-file\tsource-world-path\tmodule-world-path\tmodule-file\n";
+	private const string Header = "# Polytoria Luau module map v2\n" +
+		"# S\tworld-id\tsource-file\tsource-world-path\n" +
+		"# M\tworld-id\tmodule-world-path\tmodule-file\n";
 
 	/// <summary>
 	/// Rebuilds the map and returns true when its contents changed.
@@ -34,29 +35,26 @@ public static class LuauModuleMapService
 
 		SortedSet<string> rows = new(StringComparer.Ordinal);
 
-		foreach (World world in session.OpenedWorlds)
+		for (int worldIndex = 0; worldIndex < session.OpenedWorlds.Count; worldIndex++)
 		{
+			World world = session.OpenedWorlds[worldIndex];
+			string worldId = worldIndex.ToString(System.Globalization.CultureInfo.InvariantCulture);
+
 			List<ScriptEntry> scripts = world.GetDescendants()
 				.OfType<Script>()
 				.Select(script => CreateEntry(session, script))
-				.Where(entry => entry != null)
+				.Where(entry => entry.HasValue)
 				.Select(entry => entry!.Value)
-				.ToList();
-
-			List<ScriptEntry> modules = scripts
-				.Where(entry => entry.Script is ModuleScript)
 				.ToList();
 
 			foreach (ScriptEntry source in scripts)
 			{
-				foreach (ScriptEntry module in modules)
-				{
-					rows.Add(string.Join('\t',
-						source.ProjectPath,
-						source.WorldPath,
-						module.WorldPath,
-						module.ProjectPath));
-				}
+				rows.Add(string.Join('\t', "S", worldId, source.ProjectPath, source.WorldPath));
+			}
+
+			foreach (ScriptEntry module in scripts.Where(entry => entry.Script is ModuleScript))
+			{
+				rows.Add(string.Join('\t', "M", worldId, module.WorldPath, module.ProjectPath));
 			}
 		}
 
