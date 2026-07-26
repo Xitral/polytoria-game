@@ -19,13 +19,12 @@ public class LuaCompletionService(CreatorSession session)
 {
 	private readonly CreatorSession _session = session;
 	private readonly string _workspacePath = session.ProjectFolderPath;
+	private readonly SemaphoreSlim _lspGate = new(1, 1);
 	private Process _luaLSProcess = null!;
 	private LspClient _client = null!;
 	private readonly Dictionary<string, int> _versions = new(StringComparer.OrdinalIgnoreCase);
 	private readonly Dictionary<string, string> _lastSyncedContent = new(StringComparer.OrdinalIgnoreCase);
-	private readonly Dictionary<string, long> _lastDependencyRevision = new(StringComparer.OrdinalIgnoreCase);
 	private readonly Dictionary<string, ModuleFileState> _moduleFileStates = new(StringComparer.OrdinalIgnoreCase);
-	private long _moduleRevision;
 
 	public event Action<string, List<LspDiagnostic>>? PublishDiagnostics;
 
@@ -40,9 +39,21 @@ public class LuaCompletionService(CreatorSession session)
 
 	public async Task InitAsync()
 	{
-		LuauModuleMapService.Generate(_session);
-		RefreshModuleFileStates();
+		await _lspGate.WaitAsync();
+		try
+		{
+			LuauModuleMapService.Generate(_session);
+			RefreshModuleFileStates();
+			await StartLanguageServerCoreAsync();
+		}
+		finally
+		{
+			_lspGate.Release();
+		}
+	}
 
+	private async Task StartLanguageServerCoreAsync()
+	{
 		ProcessStartInfo processStartInfo = new()
 		{
 			FileName = NativeBinHelper.ResolveLuauLspBinPath(),
@@ -57,7 +68,7 @@ public class LuaCompletionService(CreatorSession session)
 
 		_luaLSProcess = Process.Start(processStartInfo) ?? throw new Exception("Failed to start language server process");
 
-		_luaLSProcess.ErrorDataReceived += (sender, e) =>
+		_luaLSProcess.ErrorDataReceived += (_, e) =>
 		{
 			if (!string.IsNullOrEmpty(e.Data))
 			{
@@ -71,10 +82,62 @@ public class LuaCompletionService(CreatorSession session)
 
 		_client = new LspClient(_luaLSProcess.StandardOutput.BaseStream, _luaLSProcess.StandardInput.BaseStream);
 		await _client.InitializeAsync(_workspacePath);
-
 		_client.PublishDiagnostics += OnPublishDiagnostics;
 
 		PT.Print("Language server initialized at ", _workspacePath);
+	}
+
+	private void StopLanguageServerCore()
+	{
+		if (_client != null)
+		{
+			_client.PublishDiagnostics -= OnPublishDiagnostics;
+		}
+
+		// End the process first so the LSP reader's blocking stream read is released
+		// immediately instead of waiting for its disposal timeout.
+		if (_luaLSProcess != null)
+		{
+			try
+			{
+				if (!_luaLSProcess.HasExited)
+				{
+					_luaLSProcess.Kill();
+				}
+			}
+			catch (InvalidOperationException)
+			{
+				// The process exited between HasExited and Kill.
+			}
+			finally
+			{
+				_luaLSProcess.Dispose();
+				_luaLSProcess = null!;
+			}
+		}
+
+		if (_client != null)
+		{
+			_client.Dispose();
+			_client = null!;
+		}
+	}
+
+	private async Task RestartLanguageServerCoreAsync()
+	{
+		Dictionary<string, string> openDocuments = new(_lastSyncedContent, StringComparer.OrdinalIgnoreCase);
+
+		StopLanguageServerCore();
+		await StartLanguageServerCoreAsync();
+
+		_versions.Clear();
+		foreach ((string scriptPath, string content) in openDocuments)
+		{
+			_versions[scriptPath] = 1;
+			await _client.DidOpenAsync(scriptPath, "luau", content);
+		}
+
+		PT.Print("Luau LSP refreshed module types and reopened ", openDocuments.Count, " script(s)");
 	}
 
 	private void OnPublishDiagnostics(LspPublishDiagnosticsParams @params)
@@ -91,39 +154,62 @@ public class LuaCompletionService(CreatorSession session)
 
 	public void Shutdown()
 	{
-		_client?.Dispose();
-		if (_luaLSProcess != null && !_luaLSProcess.HasExited)
-		{
-			_luaLSProcess.Kill();
-			_luaLSProcess.Dispose();
-		}
+		StopLanguageServerCore();
 	}
 
 	public async Task OpenScriptAsync(string scriptPath)
 	{
-		bool moduleMapChanged = LuauModuleMapService.Generate(_session);
-		bool moduleFilesChanged = RefreshModuleFileStates();
-		if (moduleMapChanged && !moduleFilesChanged)
+		await _lspGate.WaitAsync();
+		try
 		{
-			_moduleRevision++;
-		}
+			bool workspaceChanged = LuauModuleMapService.Generate(_session);
+			workspaceChanged |= RefreshModuleFileStates();
 
-		string content = File.ReadAllText(scriptPath);
-		_versions[scriptPath] = 1;
-		_lastSyncedContent[scriptPath] = content;
-		_lastDependencyRevision[scriptPath] = _moduleRevision;
-		await _client.DidOpenAsync(scriptPath, "luau", content);
+			if (workspaceChanged)
+			{
+				await RestartLanguageServerCoreAsync();
+			}
+
+			string content = File.ReadAllText(scriptPath);
+			_versions[scriptPath] = 1;
+			_lastSyncedContent[scriptPath] = content;
+			await _client.DidOpenAsync(scriptPath, "luau", content);
+		}
+		finally
+		{
+			_lspGate.Release();
+		}
 	}
 
 	public async Task CloseScriptAsync(string scriptPath)
 	{
-		_versions.Remove(scriptPath);
-		_lastSyncedContent.Remove(scriptPath);
-		_lastDependencyRevision.Remove(scriptPath);
-		await _client.DidCloseAsync(scriptPath);
+		await _lspGate.WaitAsync();
+		try
+		{
+			_versions.Remove(scriptPath);
+			_lastSyncedContent.Remove(scriptPath);
+			await _client.DidCloseAsync(scriptPath);
+		}
+		finally
+		{
+			_lspGate.Release();
+		}
 	}
 
 	public async Task UpdateScriptChangeAsync(string scriptPath, string scriptContent)
+	{
+		await _lspGate.WaitAsync();
+		try
+		{
+			await UpdateScriptChangeCoreAsync(scriptPath, scriptContent);
+		}
+		finally
+		{
+			_lspGate.Release();
+		}
+	}
+
+	private async Task UpdateScriptChangeCoreAsync(string scriptPath, string scriptContent)
 	{
 		if (_lastSyncedContent.TryGetValue(scriptPath, out string? previousContent) &&
 			previousContent == scriptContent)
@@ -135,14 +221,6 @@ public class LuaCompletionService(CreatorSession session)
 		_versions[scriptPath] = version;
 		_lastSyncedContent[scriptPath] = scriptContent;
 		await _client.DidChangeAsync(scriptPath, scriptContent, version);
-	}
-
-	private async Task ReopenScriptAsync(string scriptPath, string scriptContent)
-	{
-		await _client.DidCloseAsync(scriptPath);
-		await _client.DidOpenAsync(scriptPath, "luau", scriptContent);
-		_versions[scriptPath] = 1;
-		_lastSyncedContent[scriptPath] = scriptContent;
 	}
 
 	private bool RefreshModuleFileStates()
@@ -198,80 +276,74 @@ public class LuaCompletionService(CreatorSession session)
 			_moduleFileStates[path] = state;
 		}
 
-		if (changed)
-		{
-			_moduleRevision++;
-		}
-
 		return changed;
 	}
 
 	public async Task<List<CodeEditCompletionItem>> GetCompletionsAsync(CodeEditCompletionContext context, CancellationToken? cancelToken = null)
 	{
 		CancellationToken cancellationToken = cancelToken ?? CancellationToken.None;
+		await _lspGate.WaitAsync(cancellationToken);
 
-		// Rebuild from the live DataModel so renames, reparenting, relinking, and
-		// scripts located outside ScriptService are reflected immediately.
-		bool moduleMapChanged = LuauModuleMapService.Generate(_session);
-		bool moduleFilesChanged = RefreshModuleFileStates();
-		if (moduleMapChanged && !moduleFilesChanged)
+		try
 		{
-			_moduleRevision++;
-		}
+			// Keep the exact in-memory source synchronized before taking a snapshot for
+			// a possible language-server refresh.
+			await UpdateScriptChangeCoreAsync(context.ScriptPath, context.Content);
 
-		await UpdateScriptChangeAsync(context.ScriptPath, context.Content);
+			bool workspaceChanged = LuauModuleMapService.Generate(_session);
+			workspaceChanged |= RefreshModuleFileStates();
 
-		long lastRevision = _lastDependencyRevision.TryGetValue(context.ScriptPath, out long revision)
-			? revision
-			: -1;
-		bool moduleDependencyChanged = lastRevision != _moduleRevision;
-
-		// Reopening is more reliable than sending an identical didChange notification.
-		// It guarantees that Luau LSP reruns both source transforms and module inference.
-		if (moduleDependencyChanged)
-		{
-			await ReopenScriptAsync(context.ScriptPath, context.Content);
-			_lastDependencyRevision[context.ScriptPath] = _moduleRevision;
-		}
-
-		LspCompletionItem[]? completionResult = await _client.RequestCompletionAsync(
-			context.ScriptPath,
-			context.CursorLine,
-			context.CursorColumn,
-			cancellationToken);
-
-		List<CodeEditCompletionItem> items = [];
-
-		if (completionResult != null)
-		{
-			foreach (LspCompletionItem item in completionResult)
+			// Luau LSP 1.68 can retain an old exported table shape after a transformed
+			// module changes. A clean workspace restart reliably clears both the module
+			// graph and plugin document caches while preserving every open editor buffer.
+			if (workspaceChanged)
 			{
-				CodeEdit.CodeCompletionKind kind = item.Kind switch
-				{
-					9 => CodeEdit.CodeCompletionKind.Function,
-					3 => CodeEdit.CodeCompletionKind.Function,
-					21 => CodeEdit.CodeCompletionKind.Constant,
-					7 => CodeEdit.CodeCompletionKind.Class,
-					13 => CodeEdit.CodeCompletionKind.Enum,
-					6 => CodeEdit.CodeCompletionKind.Variable,
-					20 => CodeEdit.CodeCompletionKind.Member,
-					10 => CodeEdit.CodeCompletionKind.Member,
-					5 => CodeEdit.CodeCompletionKind.Member,
-					14 => CodeEdit.CodeCompletionKind.PlainText,
-					_ => CodeEdit.CodeCompletionKind.PlainText,
-				};
-
-				items.Add(new()
-				{
-					DisplayText = item.Label ?? "",
-					Kind = kind,
-					Detail = item.Detail ?? "",
-					InsertText = string.IsNullOrWhiteSpace(item.InsertText) ? item.Label ?? "" : item.InsertText
-				});
+				await RestartLanguageServerCoreAsync();
 			}
-		}
 
-		return items;
+			LspCompletionItem[]? completionResult = await _client.RequestCompletionAsync(
+				context.ScriptPath,
+				context.CursorLine,
+				context.CursorColumn,
+				cancellationToken);
+
+			List<CodeEditCompletionItem> items = [];
+
+			if (completionResult != null)
+			{
+				foreach (LspCompletionItem item in completionResult)
+				{
+					CodeEdit.CodeCompletionKind kind = item.Kind switch
+					{
+						9 => CodeEdit.CodeCompletionKind.Function,
+						3 => CodeEdit.CodeCompletionKind.Function,
+						21 => CodeEdit.CodeCompletionKind.Constant,
+						7 => CodeEdit.CodeCompletionKind.Class,
+						13 => CodeEdit.CodeCompletionKind.Enum,
+						6 => CodeEdit.CodeCompletionKind.Variable,
+						20 => CodeEdit.CodeCompletionKind.Member,
+						10 => CodeEdit.CodeCompletionKind.Member,
+						5 => CodeEdit.CodeCompletionKind.Member,
+						14 => CodeEdit.CodeCompletionKind.PlainText,
+						_ => CodeEdit.CodeCompletionKind.PlainText,
+					};
+
+					items.Add(new()
+					{
+						DisplayText = item.Label ?? "",
+						Kind = kind,
+						Detail = item.Detail ?? "",
+						InsertText = string.IsNullOrWhiteSpace(item.InsertText) ? item.Label ?? "" : item.InsertText
+					});
+				}
+			}
+
+			return items;
+		}
+		finally
+		{
+			_lspGate.Release();
+		}
 	}
 
 	private readonly record struct ModuleFileState(long LastWriteTicks, long Length);
