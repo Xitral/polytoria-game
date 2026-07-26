@@ -32,11 +32,15 @@ public class LuaCompletionService(CreatorSession session)
 	private readonly Dictionary<string, long> _completionGenerations = new(StringComparer.OrdinalIgnoreCase);
 	private readonly HashSet<World> _trackedWorlds = [];
 	private readonly List<World> _worldOrder = [];
+	private readonly Dictionary<World, int> _worldInstanceCounts = [];
 	private readonly HashSet<Instance> _trackedInstances = [];
 	private readonly HashSet<DataModelScript> _trackedScripts = [];
+	private readonly Dictionary<DataModelScript, ScriptMapState> _scriptMapStates = [];
 	private readonly HashSet<string> _linkedModuleFiles = new(StringComparer.OrdinalIgnoreCase);
 	private bool _moduleMapDirty = true;
 	private bool _languageServerRefreshPending;
+
+	private readonly record struct ScriptMapState(string WorldPath, string? LinkedPath);
 
 	public event Action<string, List<LspDiagnostic>>? PublishDiagnostics;
 
@@ -94,7 +98,6 @@ public class LuaCompletionService(CreatorSession session)
 		};
 
 		_luaLSProcess.BeginErrorReadLine();
-
 		PT.Print("LuaLS Started");
 
 		_client = new LspClient(_luaLSProcess.StandardOutput.BaseStream, _luaLSProcess.StandardInput.BaseStream);
@@ -111,8 +114,6 @@ public class LuaCompletionService(CreatorSession session)
 			_client.PublishDiagnostics -= OnPublishDiagnostics;
 		}
 
-		// End the process first so the LSP reader's blocking stream read is released
-		// immediately instead of waiting for its disposal timeout.
 		if (_luaLSProcess != null)
 		{
 			try
@@ -237,10 +238,7 @@ public class LuaCompletionService(CreatorSession session)
 		string normalizedUri = new Uri(@params.Uri).AbsoluteUri;
 		if (_client.LspPathToFull.TryGetValue(normalizedUri, out string? fullPath))
 		{
-			Callable.From(() =>
-			{
-				PublishDiagnostics?.Invoke(fullPath, @params.Diagnostics);
-			}).CallDeferred();
+			Callable.From(() => PublishDiagnostics?.Invoke(fullPath, @params.Diagnostics)).CallDeferred();
 		}
 	}
 
@@ -308,8 +306,7 @@ public class LuaCompletionService(CreatorSession session)
 
 	private async Task UpdateScriptChangeCoreAsync(string scriptPath, string scriptContent)
 	{
-		if (_lastSyncedContent.TryGetValue(scriptPath, out string? previousContent) &&
-			previousContent == scriptContent)
+		if (_lastSyncedContent.TryGetValue(scriptPath, out string? previousContent) && previousContent == scriptContent)
 		{
 			return;
 		}
@@ -349,6 +346,7 @@ public class LuaCompletionService(CreatorSession session)
 			bool containedScripts = SubtreeContainsScript(removedWorld);
 			UntrackSubtree(removedWorld);
 			_trackedWorlds.Remove(removedWorld);
+			_worldInstanceCounts.Remove(removedWorld);
 			if (containedScripts)
 			{
 				MarkModuleMapDirty();
@@ -359,11 +357,32 @@ public class LuaCompletionService(CreatorSession session)
 		{
 			if (_trackedWorlds.Add(world))
 			{
+				_worldInstanceCounts[world] = world.InstanceCount;
 				if (TrackSubtree(world))
 				{
 					MarkModuleMapDirty();
 				}
 			}
+			else if (!_worldInstanceCounts.TryGetValue(world, out int previousCount) || previousCount != world.InstanceCount)
+			{
+				// Some import/deserialization paths add a complete subtree without emitting
+				// the ordinary ChildAdded signal observed by the editor. InstanceCount is
+				// authoritative, so reconcile the hierarchy whenever it changes.
+				_worldInstanceCounts[world] = world.InstanceCount;
+				if (TrackSubtree(world))
+				{
+					MarkModuleMapDirty();
+				}
+			}
+		}
+
+		// LinkedScript can be assigned after the Instance has entered the tree while
+		// toolbox assets finish materializing their project files. Compare the small
+		// script index directly so a missed property notification cannot leave the map
+		// stale.
+		if (RefreshScriptMapStates())
+		{
+			MarkModuleMapDirty();
 		}
 
 		if (worldOrderChanged)
@@ -376,29 +395,29 @@ public class LuaCompletionService(CreatorSession session)
 
 	private bool TrackSubtree(Instance instance)
 	{
-		if (!_trackedInstances.Add(instance))
+		bool addedScript = false;
+		if (_trackedInstances.Add(instance))
 		{
-			return SubtreeContainsScript(instance);
+			instance.ChildAdded.Connect(OnTrackedChildAdded);
+			instance.ChildRemoved.Connect(OnTrackedChildRemoved);
+			instance.Renamed.Connect(OnTrackedInstanceRenamed);
+
+			if (instance is DataModelScript script && _trackedScripts.Add(script))
+			{
+				script.PropertyChanged.Connect(OnTrackedScriptPropertyChanged);
+				_scriptMapStates[script] = GetScriptMapState(script);
+				addedScript = true;
+			}
 		}
 
-		instance.ChildAdded.Connect(OnTrackedChildAdded);
-		instance.ChildRemoved.Connect(OnTrackedChildRemoved);
-		instance.Renamed.Connect(OnTrackedInstanceRenamed);
-
-		bool containsScript = false;
-		if (instance is DataModelScript script)
-		{
-			_trackedScripts.Add(script);
-			script.PropertyChanged.Connect(OnTrackedScriptPropertyChanged);
-			containsScript = true;
-		}
-
+		// Always recurse. A parent may already be tracked while an imported child was
+		// inserted through a path that did not emit ChildAdded.
 		foreach (Instance child in instance.GetChildren())
 		{
-			containsScript |= TrackSubtree(child);
+			addedScript |= TrackSubtree(child);
 		}
 
-		return containsScript;
+		return addedScript;
 	}
 
 	private void UntrackSubtree(Instance instance)
@@ -421,6 +440,7 @@ public class LuaCompletionService(CreatorSession session)
 		{
 			script.PropertyChanged.Disconnect(OnTrackedScriptPropertyChanged);
 			_trackedScripts.Remove(script);
+			_scriptMapStates.Remove(script);
 		}
 	}
 
@@ -433,6 +453,8 @@ public class LuaCompletionService(CreatorSession session)
 		}
 		_trackedWorlds.Clear();
 		_worldOrder.Clear();
+		_worldInstanceCounts.Clear();
+		_scriptMapStates.Clear();
 	}
 
 	private void OnTrackedChildAdded(Instance child)
@@ -455,8 +477,6 @@ public class LuaCompletionService(CreatorSession session)
 
 	private void OnTrackedInstanceRenamed()
 	{
-		// Renaming an instance may change the LuaPath of scripts below it. Changes
-		// are coalesced and only rebuild the script-only map once.
 		MarkModuleMapDirty();
 	}
 
@@ -466,6 +486,26 @@ public class LuaCompletionService(CreatorSession session)
 		{
 			MarkModuleMapDirty();
 		}
+	}
+
+	private bool RefreshScriptMapStates()
+	{
+		bool changed = false;
+		foreach (DataModelScript script in _trackedScripts)
+		{
+			ScriptMapState current = GetScriptMapState(script);
+			if (!_scriptMapStates.TryGetValue(script, out ScriptMapState previous) || previous != current)
+			{
+				_scriptMapStates[script] = current;
+				changed = true;
+			}
+		}
+		return changed;
+	}
+
+	private static ScriptMapState GetScriptMapState(DataModelScript script)
+	{
+		return new(script.LuaPath, script.LinkedScript?.LinkedPath);
 	}
 
 	private static bool SubtreeContainsScript(Instance instance)
@@ -590,9 +630,7 @@ public class LuaCompletionService(CreatorSession session)
 	{
 		lock (_stateLock)
 		{
-			long generation = _completionGenerations.TryGetValue(scriptPath, out long current)
-				? current + 1
-				: 1;
+			long generation = _completionGenerations.TryGetValue(scriptPath, out long current) ? current + 1 : 1;
 			_completionGenerations[scriptPath] = generation;
 			return generation;
 		}
@@ -633,10 +671,6 @@ public class LuaCompletionService(CreatorSession session)
 				return [];
 			}
 
-			// Text changes are synchronized by TextEditorRoot before it asks for
-			// completion. Never let an older queued completion snapshot overwrite a
-			// newer editor buffer, which previously caused require paths to oscillate
-			// and repeatedly reopen the same document after a module move.
 			if (_lastSyncedContent.TryGetValue(context.ScriptPath, out string? latestContent))
 			{
 				if (!string.Equals(latestContent, context.Content, StringComparison.Ordinal))
@@ -674,7 +708,6 @@ public class LuaCompletionService(CreatorSession session)
 			}
 
 			List<CodeEditCompletionItem> items = [];
-
 			if (completionResult != null)
 			{
 				foreach (LspCompletionItem item in completionResult)
