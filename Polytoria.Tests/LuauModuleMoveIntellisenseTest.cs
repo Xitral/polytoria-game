@@ -60,7 +60,14 @@ public class LuauModuleMoveIntellisenseTest
 			File.WriteAllText(serverPath, initialServerSource);
 			WriteModuleMap(mapPath, "world.ScriptService.MathUtil");
 
-			(process, client) = await StartClientAsync(repositoryRoot, workspacePath, modulePath, initialModuleSource, serverPath, initialServerSource, testCancellation);
+			(process, client) = await StartClientAsync(
+				repositoryRoot,
+				workspacePath,
+				modulePath,
+				initialModuleSource,
+				serverPath,
+				initialServerSource,
+				testCancellation);
 
 			HashSet<string> labels = await WaitForCompletionsAsync(
 				client,
@@ -78,7 +85,14 @@ public class LuauModuleMoveIntellisenseTest
 			process = null;
 			client = null;
 
-			(process, client) = await StartClientAsync(repositoryRoot, workspacePath, modulePath, initialModuleSource, serverPath, initialServerSource, testCancellation);
+			(process, client) = await StartClientAsync(
+				repositoryRoot,
+				workspacePath,
+				modulePath,
+				initialModuleSource,
+				serverPath,
+				initialServerSource,
+				testCancellation);
 
 			string movedServerSource = CreateServerSource("world.Environment.MathUtil");
 			File.WriteAllText(serverPath, movedServerSource);
@@ -107,7 +121,22 @@ public class LuauModuleMoveIntellisenseTest
 				return MathUtil
 				""";
 			File.WriteAllText(modulePath, addedExportSource);
-			await client.DidChangeAsync(modulePath, addedExportSource, 2);
+
+			// LuaCompletionService intentionally restarts the built-in language server
+			// when a linked ModuleScript file changes. The source-transform plugins are
+			// applied during indexing, so a raw didChange on LspClient is not the same
+			// operation as Creator's production refresh path.
+			StopClient(process, client);
+			process = null;
+			client = null;
+			(process, client) = await StartClientAsync(
+				repositoryRoot,
+				workspacePath,
+				modulePath,
+				addedExportSource,
+				serverPath,
+				movedServerSource,
+				testCancellation);
 
 			labels = await WaitForCompletionsAsync(
 				client,
@@ -128,7 +157,18 @@ public class LuauModuleMoveIntellisenseTest
 				return MathUtil
 				""";
 			File.WriteAllText(modulePath, removedExportSource);
-			await client.DidChangeAsync(modulePath, removedExportSource, 3);
+
+			StopClient(process, client);
+			process = null;
+			client = null;
+			(process, client) = await StartClientAsync(
+				repositoryRoot,
+				workspacePath,
+				modulePath,
+				removedExportSource,
+				serverPath,
+				movedServerSource,
+				testCancellation);
 
 			labels = await WaitForCompletionsAsync(
 				client,
