@@ -17,11 +17,11 @@ public class LuauGlobalDefinitionsIntellisenseTest
 		using LuauLspTestWorkspace workspace = new("polytoria-global-definitions-lsp");
 
 		workspace.WriteFile(".poly/luau/def.d.luau", """
-			declare class Instance
+			declare extern type Instance with
 				Name: string
 			end
 
-			declare class Vector
+			declare extern type Vector with
 				X: number
 				Y: number
 				Z: number
@@ -29,6 +29,16 @@ public class LuauGlobalDefinitionsIntellisenseTest
 
 			declare Vector: {
 				New: (number, number, number) -> Vector,
+			}
+
+			declare extern type Vector3 with
+				X: number
+				Y: number
+				Z: number
+			end
+
+			declare Vector3: {
+				New: (number, number, number) -> Vector3,
 			}
 			""");
 
@@ -55,10 +65,11 @@ public class LuauGlobalDefinitionsIntellisenseTest
 			scriptPath,
 			1,
 			"local direction = Vec".Length,
-			labels => labels.Contains("Vector"),
+			labels => labels.Contains("Vector") && labels.Contains("Vector3"),
 			testCancellation);
 
 		Assert.Contains("Instance", typeLabels);
 		Assert.Contains("Vector", valueLabels);
+		Assert.Contains("Vector3", valueLabels);
 	}
 }
