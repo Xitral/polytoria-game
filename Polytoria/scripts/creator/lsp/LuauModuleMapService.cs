@@ -82,6 +82,43 @@ public static class LuauModuleMapService
 		return true;
 	}
 
+	/// <summary>
+	/// Returns whether an absolute editor file path is linked to a ModuleScript
+	/// in any currently open world.
+	/// </summary>
+	public static bool IsLinkedModuleFile(CreatorSession session, string filePath)
+	{
+		string targetPath = Path.GetFullPath(filePath);
+
+		foreach (World world in session.OpenedWorlds)
+		{
+			foreach (Instance instance in world.GetDescendants())
+			{
+				if (instance is not ModuleScript module)
+				{
+					continue;
+				}
+
+				string? linkedPath = module.LinkedScript?.LinkedPath;
+				if (string.IsNullOrWhiteSpace(linkedPath))
+				{
+					continue;
+				}
+
+				string absolutePath = Path.IsPathRooted(linkedPath)
+					? Path.GetFullPath(linkedPath)
+					: Path.GetFullPath(Path.Join(session.ProjectFolderPath, linkedPath));
+
+				if (string.Equals(targetPath, absolutePath, StringComparison.OrdinalIgnoreCase))
+				{
+					return true;
+				}
+			}
+		}
+
+		return false;
+	}
+
 	private static ScriptEntry? CreateEntry(CreatorSession session, Script script)
 	{
 		string? linkedPath = script.LinkedScript?.LinkedPath;
