@@ -198,33 +198,27 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 		{
 			bool directRequireChanged = false;
 			string languageId = "luau";
+			int nextVersion = Math.Max(version, 1);
 			if (_openDocuments.TryGetValue(path, out OpenDocument existing))
 			{
 				languageId = existing.LanguageId;
+				nextVersion = Math.Max(version, existing.Version + 1);
 				directRequireChanged = !string.Equals(
 					GetDirectModuleRequireSignature(existing.Text),
 					GetDirectModuleRequireSignature(text),
 					StringComparison.Ordinal);
 			}
 
-			_openDocuments[path] = new OpenDocument(languageId, text, version);
+			_openDocuments[path] = new OpenDocument(languageId, text, nextVersion);
 			if (directRequireChanged)
 			{
-				// Luau LSP can retain the previous transformed require target after a
-				// world-path edit. Reopen this one document immediately before its next
-				// completion request so the plugin resolves against the current module map.
+				// The module map may be regenerated after this text notification. Queue a
+				// second didChange immediately before completion so Luau LSP invalidates
+				// its transformed-document cache against the final map.
 				_documentsNeedingTransformRefresh.Add(path);
 			}
 
-			await SendNotificationAsync("textDocument/didChange", new LspDidChangeParams
-			{
-				TextDocument = new()
-				{
-					Uri = LspHelper.PathToUri(path),
-					Version = version
-				},
-				ContentChanges = [new() { Text = text }]
-			});
+			await SendDidChangeNotificationAsync(path, text, nextVersion);
 		}
 		finally
 		{
@@ -254,6 +248,19 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 		});
 	}
 
+	private Task SendDidChangeNotificationAsync(string path, string text, int version)
+	{
+		return SendNotificationAsync("textDocument/didChange", new LspDidChangeParams
+		{
+			TextDocument = new()
+			{
+				Uri = LspHelper.PathToUri(path),
+				Version = version
+			},
+			ContentChanges = [new() { Text = text }]
+		});
+	}
+
 	private async Task ReplayOpenDocumentsAfterPluginLoadAsync()
 	{
 		await _documentStateGate.WaitAsync();
@@ -262,8 +269,9 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 			KeyValuePair<string, OpenDocument>[] documents = [.. _openDocuments];
 			foreach ((string path, OpenDocument document) in documents)
 			{
-				await SendDidCloseNotificationAsync(path);
-				await SendDidOpenNotificationAsync(path, document.LanguageId, document.Text, document.Version);
+				int nextVersion = document.Version + 1;
+				_openDocuments[path] = document with { Version = nextVersion };
+				await SendDidChangeNotificationAsync(path, document.Text, nextVersion);
 			}
 
 			_documentsNeedingTransformRefresh.Clear();
@@ -302,9 +310,10 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 				return;
 			}
 
-			await SendDidCloseNotificationAsync(path);
-			await SendDidOpenNotificationAsync(path, document.LanguageId, document.Text, document.Version);
-			PT.Print("Luau LSP refreshed require transforms for ", path);
+			int nextVersion = document.Version + 1;
+			_openDocuments[path] = document with { Version = nextVersion };
+			await SendDidChangeNotificationAsync(path, document.Text, nextVersion);
+			PT.Print("Luau LSP invalidated require transforms for ", path);
 		}
 		finally
 		{
