@@ -7,9 +7,7 @@ using Polytoria.Shared;
 using System;
 using System.Collections.Generic;
 using System.IO;
-using System.Text;
 using System.Text.Json;
-using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -23,24 +21,9 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 		"./.poly/luau/polytoria-module-types.luau"
 	];
 
-	private static readonly Regex DirectModuleRequireRegex = new(
-		@"\brequire\s*\(\s*((?:world|script)(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_]*)+)\s*\)",
-		RegexOptions.CultureInvariant);
-
-	private readonly TaskCompletionSource _workspaceIndexed = new(TaskCreationOptions.RunContinuationsAsynchronously);
-	private readonly TaskCompletionSource _documentsReplayed = new(TaskCreationOptions.RunContinuationsAsynchronously);
-	private readonly SemaphoreSlim _documentStateGate = new(1, 1);
-	private readonly Dictionary<string, OpenDocument> _openDocuments = new(StringComparer.OrdinalIgnoreCase);
-	private readonly HashSet<string> _documentsNeedingTransformRefresh = new(StringComparer.OrdinalIgnoreCase);
-	private int _indexTimeoutReported;
-	private int _replayTimeoutReported;
-	private int _pluginReplayStarted;
-
 	public readonly Dictionary<string, string> LspPathToFull = new(StringComparer.OrdinalIgnoreCase);
 	public readonly Dictionary<string, string> FullToLspPath = new(StringComparer.OrdinalIgnoreCase);
 	public event Action<LspPublishDiagnosticsParams>? PublishDiagnostics;
-
-	private readonly record struct OpenDocument(string LanguageId, string Text, int Version);
 
 	public async Task InitializeAsync(string workspacePath)
 	{
@@ -87,168 +70,38 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 		await SendNotificationAsync("initialized", new EmptyParams());
 	}
 
-	private static async Task<bool> WaitForReadySignalAsync(
-		TaskCompletionSource signal,
-		CancellationToken cancellationToken)
+	public Task DidOpenAsync(string path, string languageId, string text)
 	{
-		if (signal.Task.IsCompleted)
-		{
-			return true;
-		}
+		string uri = LspHelper.PathToUri(path);
+		LspPathToFull[uri] = path;
+		FullToLspPath[path] = uri;
 
-		using CancellationTokenSource timeout = new(TimeSpan.FromSeconds(10));
-		using CancellationTokenSource combined = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeout.Token);
-
-		try
-		{
-			await signal.Task.WaitAsync(combined.Token);
-			return true;
-		}
-		catch (OperationCanceledException) when (timeout.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
-		{
-			signal.TrySetResult();
-			return false;
-		}
-	}
-
-	private async Task WaitUntilWorkspaceIndexedAsync(CancellationToken cancellationToken)
-	{
-		if (!await WaitForReadySignalAsync(_workspaceIndexed, cancellationToken) &&
-			Interlocked.Exchange(ref _indexTimeoutReported, 1) == 0)
-		{
-			PT.PrintWarn("Timed out waiting for Luau LSP workspace indexing; continuing with the current language-server state");
-		}
-	}
-
-	private async Task WaitUntilDocumentsReplayedAsync(CancellationToken cancellationToken)
-	{
-		if (!await WaitForReadySignalAsync(_documentsReplayed, cancellationToken) &&
-			Interlocked.Exchange(ref _replayTimeoutReported, 1) == 0)
-		{
-			PT.PrintWarn("Timed out waiting for Luau plugins to be reapplied to open scripts; continuing with the current language-server state");
-		}
-	}
-
-	private static string GetDirectModuleRequireSignature(string source)
-	{
-		if (!source.Contains("require", StringComparison.Ordinal))
-		{
-			return "";
-		}
-
-		StringBuilder signature = new();
-		foreach (Match match in DirectModuleRequireRegex.Matches(source))
-		{
-			foreach (char character in match.Groups[1].Value)
-			{
-				if (!char.IsWhiteSpace(character))
-				{
-					signature.Append(character);
-				}
-			}
-			signature.Append('\n');
-		}
-
-		return signature.ToString();
-	}
-
-	public async Task DidOpenAsync(string path, string languageId, string text)
-	{
-		await _documentStateGate.WaitAsync();
-		try
-		{
-			string p = LspHelper.PathToUri(path);
-			LspPathToFull[p] = path;
-			FullToLspPath[path] = p;
-			_openDocuments[path] = new OpenDocument(languageId, text, 1);
-			_documentsNeedingTransformRefresh.Remove(path);
-
-			await SendDidOpenNotificationAsync(path, languageId, text, 1);
-		}
-		finally
-		{
-			_documentStateGate.Release();
-		}
-	}
-
-	public async Task DidCloseAsync(string path)
-	{
-		await _documentStateGate.WaitAsync();
-		try
-		{
-			_openDocuments.Remove(path);
-			_documentsNeedingTransformRefresh.Remove(path);
-			if (FullToLspPath.Remove(path, out string? p))
-			{
-				LspPathToFull.Remove(p);
-			}
-
-			await SendDidCloseNotificationAsync(path);
-		}
-		finally
-		{
-			_documentStateGate.Release();
-		}
-	}
-
-	public async Task DidChangeAsync(string path, string text, int version)
-	{
-		await _documentStateGate.WaitAsync();
-		try
-		{
-			bool directRequireChanged = false;
-			string languageId = "luau";
-			int nextVersion = Math.Max(version, 1);
-			if (_openDocuments.TryGetValue(path, out OpenDocument existing))
-			{
-				languageId = existing.LanguageId;
-				nextVersion = Math.Max(version, existing.Version + 1);
-				directRequireChanged = !string.Equals(
-					GetDirectModuleRequireSignature(existing.Text),
-					GetDirectModuleRequireSignature(text),
-					StringComparison.Ordinal);
-			}
-
-			_openDocuments[path] = new OpenDocument(languageId, text, nextVersion);
-			if (directRequireChanged)
-			{
-				// The module map may be regenerated after this text notification. Queue a
-				// second didChange immediately before completion so Luau LSP invalidates
-				// its transformed-document cache against the final map.
-				_documentsNeedingTransformRefresh.Add(path);
-			}
-
-			await SendDidChangeNotificationAsync(path, text, nextVersion);
-		}
-		finally
-		{
-			_documentStateGate.Release();
-		}
-	}
-
-	private Task SendDidOpenNotificationAsync(string path, string languageId, string text, int version)
-	{
 		return SendNotificationAsync("textDocument/didOpen", new LspDidOpenParams
 		{
 			TextDocument = new LspTextDocumentItem
 			{
-				Uri = LspHelper.PathToUri(path),
+				Uri = uri,
 				LanguageId = languageId,
-				Version = version,
+				Version = 1,
 				Text = text
 			}
 		});
 	}
 
-	private Task SendDidCloseNotificationAsync(string path)
+	public Task DidCloseAsync(string path)
 	{
+		if (FullToLspPath.Remove(path, out string? uri))
+		{
+			LspPathToFull.Remove(uri);
+		}
+
 		return SendNotificationAsync("textDocument/didClose", new LspDidCloseParams
 		{
 			TextDocument = new() { Uri = LspHelper.PathToUri(path) }
 		});
 	}
 
-	private Task SendDidChangeNotificationAsync(string path, string text, int version)
+	public Task DidChangeAsync(string path, string text, int version)
 	{
 		return SendNotificationAsync("textDocument/didChange", new LspDidChangeParams
 		{
@@ -261,72 +114,8 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 		});
 	}
 
-	private async Task ReplayOpenDocumentsAfterPluginLoadAsync()
-	{
-		await _documentStateGate.WaitAsync();
-		try
-		{
-			KeyValuePair<string, OpenDocument>[] documents = [.. _openDocuments];
-			foreach ((string path, OpenDocument document) in documents)
-			{
-				int nextVersion = document.Version + 1;
-				_openDocuments[path] = document with { Version = nextVersion };
-				await SendDidChangeNotificationAsync(path, document.Text, nextVersion);
-			}
-
-			_documentsNeedingTransformRefresh.Clear();
-			if (documents.Length > 0)
-			{
-				PT.Print("Luau LSP reapplied plugins to ", documents.Length, " open script(s)");
-			}
-		}
-		catch (Exception ex)
-		{
-			PT.PrintErr("Failed to reapply Luau plugins to open scripts: ", ex.Message);
-		}
-		finally
-		{
-			_documentsReplayed.TrySetResult();
-			_documentStateGate.Release();
-		}
-	}
-
-	private void StartDocumentReplayIfNeeded()
-	{
-		if (Interlocked.Exchange(ref _pluginReplayStarted, 1) == 0)
-		{
-			_ = ReplayOpenDocumentsAfterPluginLoadAsync();
-		}
-	}
-
-	private async Task RefreshDocumentTransformIfNeededAsync(string path)
-	{
-		await _documentStateGate.WaitAsync();
-		try
-		{
-			if (!_documentsNeedingTransformRefresh.Remove(path) ||
-				!_openDocuments.TryGetValue(path, out OpenDocument document))
-			{
-				return;
-			}
-
-			int nextVersion = document.Version + 1;
-			_openDocuments[path] = document with { Version = nextVersion };
-			await SendDidChangeNotificationAsync(path, document.Text, nextVersion);
-			PT.Print("Luau LSP invalidated require transforms for ", path);
-		}
-		finally
-		{
-			_documentStateGate.Release();
-		}
-	}
-
 	public async Task<LspCompletionItem[]?> RequestCompletionAsync(string path, int line, int character, CancellationToken cancellationToken)
 	{
-		await WaitUntilWorkspaceIndexedAsync(cancellationToken);
-		await WaitUntilDocumentsReplayedAsync(cancellationToken);
-		await RefreshDocumentTransformIfNeededAsync(path);
-
 		JsonElement rawResult = await SendRequestAsync<JsonElement>("textDocument/completion", new LspCompletionParams
 		{
 			TextDocument = new() { Uri = LspHelper.PathToUri(path) },
@@ -349,19 +138,6 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 		return null;
 	}
 
-	public Task<string?> RequestInternalSourceAsync(string path, CancellationToken cancellationToken = default)
-	{
-		Dictionary<string, object> parameters = new()
-		{
-			["textDocument"] = new LspTextDocumentIdentifier
-			{
-				Uri = LspHelper.PathToUri(path)
-			}
-		};
-
-		return SendRequestAsync<string>("luau-lsp/debug/viewInternalSource", parameters, cancellationToken);
-	}
-
 	protected override void HandleServerNotification(string method, JsonElement param)
 	{
 		if (method == "textDocument/publishDiagnostics")
@@ -381,19 +157,7 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 			param.ValueKind == JsonValueKind.Object &&
 			param.TryGetProperty("message", out JsonElement message))
 		{
-			string messageText = message.GetString() ?? "";
-			PT.Print("Luau LSP: ", messageText);
-
-			if (messageText.StartsWith($"Loaded {PluginPaths.Length} of {PluginPaths.Length} plugins", StringComparison.Ordinal))
-			{
-				StartDocumentReplayIfNeeded();
-			}
-
-			if (messageText.StartsWith("Indexed ", StringComparison.Ordinal))
-			{
-				StartDocumentReplayIfNeeded();
-				_workspaceIndexed.TrySetResult();
-			}
+			PT.Print("Luau LSP: ", message.GetString() ?? "");
 		}
 	}
 
@@ -404,6 +168,13 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 			["platform"] = new Dictionary<string, object>
 			{
 				["type"] = "standard"
+			},
+			["completion"] = new Dictionary<string, object>
+			{
+				// Fragment autocomplete reuses the previous dependency graph. A source
+				// transform can change the require target after an Instance move, so the
+				// full completion typecheck is required to rebuild that graph correctly.
+				["enableFragmentAutocomplete"] = false
 			},
 			["plugins"] = new Dictionary<string, object>
 			{
@@ -433,41 +204,31 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 				}
 
 				object[] configurations = new object[configurationCount];
-				for (int i = 0; i < configurations.Length; i++)
+				for (int index = 0; index < configurations.Length; index++)
 				{
-					configurations[i] = CreateLuauConfiguration();
+					configurations[index] = CreateLuauConfiguration();
 				}
 
 				PT.Print("Luau LSP requested ", configurationCount, " configuration entries; enabling ", PluginPaths.Length, " Polytoria plugins");
 
-				LspResponse response = new()
+				await WriteMessageAsync(new LspResponse
 				{
 					Id = id.Clone(),
 					Result = configurations
-				};
-
-				await WriteMessageAsync(response, CancellationToken.None);
+				}, CancellationToken.None);
 			}
 			else
 			{
-				LspResponse response = new()
+				await WriteMessageAsync(new LspResponse
 				{
 					Id = id.Clone(),
 					Result = new EmptyParams()
-				};
-
-				await WriteMessageAsync(response, CancellationToken.None);
+				}, CancellationToken.None);
 			}
 		}
 		catch (Exception ex)
 		{
 			PT.PrintErr($"Error handling server request '{method}': {ex.Message}");
 		}
-	}
-
-	public override void Dispose()
-	{
-		_documentStateGate.Dispose();
-		base.Dispose();
 	}
 }
