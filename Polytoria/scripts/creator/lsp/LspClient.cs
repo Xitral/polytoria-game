@@ -120,7 +120,6 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 			return rawResult.Deserialize(LspJsonContext.Default.LspCompletionItemArray);
 		}
 
-		// LSP allows completion responses to be returned as a CompletionList object.
 		if (rawResult.ValueKind == JsonValueKind.Object &&
 			rawResult.TryGetProperty("items", out JsonElement items) &&
 			items.ValueKind == JsonValueKind.Array)
@@ -155,7 +154,6 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 
 			if (data != null)
 			{
-				// Fix : on windows
 				data.Uri = data.Uri.Replace("%3A", ":");
 				PublishDiagnostics?.Invoke(data);
 			}
@@ -179,7 +177,11 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 			["plugins"] = new Dictionary<string, object>
 			{
 				["enabled"] = true,
-				["paths"] = new[] { RequirePluginPath }
+				["paths"] = new[] { RequirePluginPath },
+				["fileSystem"] = new Dictionary<string, object>
+				{
+					["enabled"] = true
+				}
 			}
 		};
 	}
