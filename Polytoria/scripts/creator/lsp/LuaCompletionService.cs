@@ -12,6 +12,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
+using DataModelScript = Polytoria.Datamodel.Script;
 
 namespace Polytoria.Creator.LSP;
 
@@ -24,7 +25,14 @@ public class LuaCompletionService(CreatorSession session)
 	private LspClient _client = null!;
 	private readonly Dictionary<string, int> _versions = new(StringComparer.OrdinalIgnoreCase);
 	private readonly Dictionary<string, string> _lastSyncedContent = new(StringComparer.OrdinalIgnoreCase);
-	private readonly Dictionary<string, ModuleFileState> _moduleFileStates = new(StringComparer.OrdinalIgnoreCase);
+	private readonly HashSet<World> _trackedWorlds = [];
+	private readonly List<World> _worldOrder = [];
+	private readonly HashSet<Instance> _trackedInstances = [];
+	private readonly HashSet<DataModelScript> _trackedScripts = [];
+	private readonly HashSet<string> _linkedModuleFiles = new(StringComparer.OrdinalIgnoreCase);
+	private readonly Dictionary<string, string> _lastSavedModuleContent = new(StringComparer.OrdinalIgnoreCase);
+	private bool _moduleMapDirty = true;
+	private bool _languageServerRefreshPending;
 
 	public event Action<string, List<LspDiagnostic>>? PublishDiagnostics;
 
@@ -42,8 +50,12 @@ public class LuaCompletionService(CreatorSession session)
 		await _lspGate.WaitAsync();
 		try
 		{
-			LuauModuleMapService.Generate(_session);
-			RefreshModuleFileStates();
+			SynchronizeTrackedWorlds();
+			FlushModuleMapIfDirty();
+
+			// The initial server starts after the current map is already on disk, so no
+			// follow-up refresh is needed for that first generated snapshot.
+			_languageServerRefreshPending = false;
 			await StartLanguageServerCoreAsync();
 		}
 		finally
@@ -137,6 +149,7 @@ public class LuaCompletionService(CreatorSession session)
 			await _client.DidOpenAsync(scriptPath, "luau", content);
 		}
 
+		_languageServerRefreshPending = false;
 		PT.Print("Luau LSP refreshed module types and reopened ", openDocuments.Count, " script(s)");
 	}
 
@@ -154,6 +167,7 @@ public class LuaCompletionService(CreatorSession session)
 
 	public void Shutdown()
 	{
+		UntrackAllWorlds();
 		StopLanguageServerCore();
 	}
 
@@ -162,10 +176,9 @@ public class LuaCompletionService(CreatorSession session)
 		await _lspGate.WaitAsync();
 		try
 		{
-			bool workspaceChanged = LuauModuleMapService.Generate(_session);
-			workspaceChanged |= RefreshModuleFileStates();
-
-			if (workspaceChanged)
+			SynchronizeTrackedWorlds();
+			FlushModuleMapIfDirty();
+			if (_languageServerRefreshPending)
 			{
 				await RestartLanguageServerCoreAsync();
 			}
@@ -209,6 +222,38 @@ public class LuaCompletionService(CreatorSession session)
 		}
 	}
 
+	/// <summary>
+	/// Records a completed editor save. Module export changes are coalesced into
+	/// one clean language-server refresh on the next completion/open request.
+	/// </summary>
+	public async Task NotifyScriptSavedAsync(string scriptPath, string scriptContent)
+	{
+		await _lspGate.WaitAsync();
+		try
+		{
+			await UpdateScriptChangeCoreAsync(scriptPath, scriptContent);
+			SynchronizeTrackedWorlds();
+			FlushModuleMapIfDirty();
+
+			string absolutePath = Path.GetFullPath(scriptPath);
+			if (_linkedModuleFiles.Contains(absolutePath))
+			{
+				bool contentChanged = !_lastSavedModuleContent.TryGetValue(absolutePath, out string? previousContent) ||
+					previousContent != scriptContent;
+				_lastSavedModuleContent[absolutePath] = scriptContent;
+
+				if (contentChanged)
+				{
+					_languageServerRefreshPending = true;
+				}
+			}
+		}
+		finally
+		{
+			_lspGate.Release();
+		}
+	}
+
 	private async Task UpdateScriptChangeCoreAsync(string scriptPath, string scriptContent)
 	{
 		if (_lastSyncedContent.TryGetValue(scriptPath, out string? previousContent) &&
@@ -223,60 +268,233 @@ public class LuaCompletionService(CreatorSession session)
 		await _client.DidChangeAsync(scriptPath, scriptContent, version);
 	}
 
-	private bool RefreshModuleFileStates()
+	private void SynchronizeTrackedWorlds()
 	{
-		Dictionary<string, ModuleFileState> currentStates = new(StringComparer.OrdinalIgnoreCase);
-
-		foreach (World world in _session.OpenedWorlds)
+		bool worldOrderChanged = _worldOrder.Count != _session.OpenedWorlds.Count;
+		if (!worldOrderChanged)
 		{
-			foreach (Instance instance in world.GetDescendants())
+			for (int index = 0; index < _worldOrder.Count; index++)
 			{
-				if (instance is not ModuleScript module)
+				if (!ReferenceEquals(_worldOrder[index], _session.OpenedWorlds[index]))
 				{
-					continue;
-				}
-
-				string? linkedPath = module.LinkedScript?.LinkedPath;
-				if (string.IsNullOrWhiteSpace(linkedPath))
-				{
-					continue;
-				}
-
-				string absolutePath = Path.IsPathRooted(linkedPath)
-					? Path.GetFullPath(linkedPath)
-					: Path.GetFullPath(Path.Join(_session.ProjectFolderPath, linkedPath));
-
-				if (!File.Exists(absolutePath))
-				{
-					continue;
-				}
-
-				FileInfo file = new(absolutePath);
-				currentStates[absolutePath] = new(file.LastWriteTimeUtc.Ticks, file.Length);
-			}
-		}
-
-		bool changed = currentStates.Count != _moduleFileStates.Count;
-		if (!changed)
-		{
-			foreach ((string path, ModuleFileState state) in currentStates)
-			{
-				if (!_moduleFileStates.TryGetValue(path, out ModuleFileState previousState) ||
-					previousState != state)
-				{
-					changed = true;
+					worldOrderChanged = true;
 					break;
 				}
 			}
 		}
 
-		_moduleFileStates.Clear();
-		foreach ((string path, ModuleFileState state) in currentStates)
+		List<World> removedWorlds = [];
+		foreach (World trackedWorld in _trackedWorlds)
 		{
-			_moduleFileStates[path] = state;
+			if (!_session.OpenedWorlds.Contains(trackedWorld))
+			{
+				removedWorlds.Add(trackedWorld);
+			}
 		}
 
-		return changed;
+		foreach (World removedWorld in removedWorlds)
+		{
+			bool containedScripts = SubtreeContainsScript(removedWorld);
+			UntrackSubtree(removedWorld);
+			_trackedWorlds.Remove(removedWorld);
+			if (containedScripts)
+			{
+				_moduleMapDirty = true;
+			}
+		}
+
+		foreach (World world in _session.OpenedWorlds)
+		{
+			if (_trackedWorlds.Add(world))
+			{
+				if (TrackSubtree(world))
+				{
+					_moduleMapDirty = true;
+				}
+			}
+		}
+
+		if (worldOrderChanged)
+		{
+			_moduleMapDirty = true;
+			_worldOrder.Clear();
+			_worldOrder.AddRange(_session.OpenedWorlds);
+		}
+	}
+
+	private bool TrackSubtree(Instance instance)
+	{
+		if (!_trackedInstances.Add(instance))
+		{
+			return SubtreeContainsScript(instance);
+		}
+
+		instance.ChildAdded.Connect(OnTrackedChildAdded);
+		instance.ChildRemoved.Connect(OnTrackedChildRemoved);
+		instance.Renamed.Connect(OnTrackedInstanceRenamed);
+
+		bool containsScript = false;
+		if (instance is DataModelScript script)
+		{
+			_trackedScripts.Add(script);
+			script.PropertyChanged.Connect(OnTrackedScriptPropertyChanged);
+			containsScript = true;
+		}
+
+		foreach (Instance child in instance.GetChildren())
+		{
+			containsScript |= TrackSubtree(child);
+		}
+
+		return containsScript;
+	}
+
+	private void UntrackSubtree(Instance instance)
+	{
+		if (!_trackedInstances.Remove(instance))
+		{
+			return;
+		}
+
+		foreach (Instance child in instance.GetChildren())
+		{
+			UntrackSubtree(child);
+		}
+
+		instance.ChildAdded.Disconnect(OnTrackedChildAdded);
+		instance.ChildRemoved.Disconnect(OnTrackedChildRemoved);
+		instance.Renamed.Disconnect(OnTrackedInstanceRenamed);
+
+		if (instance is DataModelScript script)
+		{
+			script.PropertyChanged.Disconnect(OnTrackedScriptPropertyChanged);
+			_trackedScripts.Remove(script);
+		}
+	}
+
+	private void UntrackAllWorlds()
+	{
+		List<World> worlds = [.. _trackedWorlds];
+		foreach (World world in worlds)
+		{
+			UntrackSubtree(world);
+		}
+		_trackedWorlds.Clear();
+		_worldOrder.Clear();
+	}
+
+	private void OnTrackedChildAdded(Instance child)
+	{
+		if (TrackSubtree(child))
+		{
+			_moduleMapDirty = true;
+		}
+	}
+
+	private void OnTrackedChildRemoved(Instance child)
+	{
+		bool containedScripts = SubtreeContainsScript(child);
+		UntrackSubtree(child);
+		if (containedScripts)
+		{
+			_moduleMapDirty = true;
+		}
+	}
+
+	private void OnTrackedInstanceRenamed()
+	{
+		// Renaming any ancestor changes the LuaPath of scripts below it.
+		_moduleMapDirty = true;
+	}
+
+	private void OnTrackedScriptPropertyChanged(string propertyName)
+	{
+		if (propertyName == nameof(DataModelScript.LinkedScript))
+		{
+			_moduleMapDirty = true;
+		}
+	}
+
+	private static bool SubtreeContainsScript(Instance instance)
+	{
+		if (instance is DataModelScript)
+		{
+			return true;
+		}
+
+		foreach (Instance child in instance.GetChildren())
+		{
+			if (SubtreeContainsScript(child))
+			{
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	private void FlushModuleMapIfDirty()
+	{
+		if (!_moduleMapDirty)
+		{
+			return;
+		}
+
+		_moduleMapDirty = false;
+		bool mapChanged = LuauModuleMapService.Generate(_session, _trackedScripts);
+		RebuildLinkedModuleFileIndex();
+
+		if (mapChanged)
+		{
+			_languageServerRefreshPending = true;
+		}
+	}
+
+	private void RebuildLinkedModuleFileIndex()
+	{
+		HashSet<string> currentFiles = new(StringComparer.OrdinalIgnoreCase);
+		foreach (DataModelScript script in _trackedScripts)
+		{
+			if (script is not ModuleScript)
+			{
+				continue;
+			}
+
+			string? linkedPath = script.LinkedScript?.LinkedPath;
+			if (string.IsNullOrWhiteSpace(linkedPath))
+			{
+				continue;
+			}
+
+			string absolutePath = Path.IsPathRooted(linkedPath)
+				? Path.GetFullPath(linkedPath)
+				: Path.GetFullPath(Path.Join(_session.ProjectFolderPath, linkedPath));
+			currentFiles.Add(absolutePath);
+
+			if (!_lastSavedModuleContent.ContainsKey(absolutePath) && File.Exists(absolutePath))
+			{
+				_lastSavedModuleContent[absolutePath] = File.ReadAllText(absolutePath);
+			}
+		}
+
+		_linkedModuleFiles.Clear();
+		foreach (string path in currentFiles)
+		{
+			_linkedModuleFiles.Add(path);
+		}
+
+		List<string> removedFiles = [];
+		foreach (string path in _lastSavedModuleContent.Keys)
+		{
+			if (!currentFiles.Contains(path))
+			{
+				removedFiles.Add(path);
+			}
+		}
+		foreach (string path in removedFiles)
+		{
+			_lastSavedModuleContent.Remove(path);
+		}
 	}
 
 	public async Task<List<CodeEditCompletionItem>> GetCompletionsAsync(CodeEditCompletionContext context, CancellationToken? cancelToken = null)
@@ -290,13 +508,12 @@ public class LuaCompletionService(CreatorSession session)
 			// a possible language-server refresh.
 			await UpdateScriptChangeCoreAsync(context.ScriptPath, context.Content);
 
-			bool workspaceChanged = LuauModuleMapService.Generate(_session);
-			workspaceChanged |= RefreshModuleFileStates();
+			SynchronizeTrackedWorlds();
+			FlushModuleMapIfDirty();
 
-			// Luau LSP 1.68 can retain an old exported table shape after a transformed
-			// module changes. A clean workspace restart reliably clears both the module
-			// graph and plugin document caches while preserving every open editor buffer.
-			if (workspaceChanged)
+			// Module saves and hierarchy changes are coalesced. The ordinary completion
+			// path performs no world traversal, file timestamp scan, or map rebuild.
+			if (_languageServerRefreshPending)
 			{
 				await RestartLanguageServerCoreAsync();
 			}
@@ -345,8 +562,6 @@ public class LuaCompletionService(CreatorSession session)
 			_lspGate.Release();
 		}
 	}
-
-	private readonly record struct ModuleFileState(long LastWriteTicks, long Length);
 }
 
 public struct CodeEditCompletionItem
