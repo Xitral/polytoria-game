@@ -17,11 +17,11 @@ namespace Polytoria.Creator.LSP;
 /// moving a ModuleScript in Creator is reflected in an already-open VS Code
 /// workspace without opening or saving either script in Creator.
 /// </summary>
-public partial class VSCodeModuleMapSyncService : Node
+public sealed partial class VSCodeModuleMapSyncService : Node
 {
 	private static readonly ConditionalWeakTable<CreatorSession, VSCodeModuleMapSyncService> Services = new();
 
-	private readonly CreatorSession _session;
+	private CreatorSession _session = null!;
 	private readonly HashSet<World> _trackedWorlds = [];
 	private readonly List<World> _worldOrder = [];
 	private readonly HashSet<Instance> _trackedInstances = [];
@@ -30,9 +30,8 @@ public partial class VSCodeModuleMapSyncService : Node
 	private bool _mapDirty = true;
 	private bool _refreshQueued;
 
-	private VSCodeModuleMapSyncService(CreatorSession session)
+	public VSCodeModuleMapSyncService()
 	{
-		_session = session;
 		Name = "VSCodeModuleMapSyncService";
 	}
 
@@ -43,7 +42,10 @@ public partial class VSCodeModuleMapSyncService : Node
 			return;
 		}
 
-		VSCodeModuleMapSyncService service = new(session);
+		VSCodeModuleMapSyncService service = new()
+		{
+			_session = session
+		};
 		Services.Add(session, service);
 		session.AddChild(service);
 		service.SetProcess(true);
@@ -261,9 +263,9 @@ public partial class VSCodeModuleMapSyncService : Node
 
 	private void FlushMap()
 	{
-		_refreshQueued = false;
 		if (!_wasActive || !_mapDirty)
 		{
+			_refreshQueued = false;
 			return;
 		}
 
@@ -271,6 +273,7 @@ public partial class VSCodeModuleMapSyncService : Node
 		_mapDirty = false;
 		VSCodeConfigService.Ensure(_session.ProjectFolderPath);
 		LuauModuleMapService.Generate(_session, _trackedScripts);
+		_refreshQueued = false;
 	}
 
 	private static bool SubtreeContainsScript(Instance instance)
