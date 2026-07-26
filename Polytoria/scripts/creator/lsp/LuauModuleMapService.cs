@@ -6,6 +6,7 @@ using Polytoria.Datamodel;
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Runtime.CompilerServices;
 using System.Text;
 using Script = Polytoria.Datamodel.Script;
 
@@ -23,6 +24,18 @@ public static class LuauModuleMapService
 	private const string Header = "# Polytoria Luau module map v2\n" +
 		"# S\tworld-id\tsource-file\tsource-world-path\n" +
 		"# M\tworld-id\tmodule-world-path\tmodule-file\n";
+
+	// Creator's built-in language server and the VS Code synchronizer share one
+	// map file but maintain separate script indexes. A disk-only comparison is
+	// insufficient: one service can write the new map before the other service
+	// checks it, causing the second language server to miss a required refresh.
+	// Track the last snapshot seen by each stable script-index object instead.
+	private static readonly ConditionalWeakTable<object, ConsumerSnapshot> ConsumerSnapshots = new();
+
+	private sealed class ConsumerSnapshot
+	{
+		public string Content = "";
+	}
 
 	/// <summary>
 	/// Rebuilds the map by scanning every open world. Prefer the tracked-script
@@ -47,7 +60,7 @@ public static class LuauModuleMapService
 
 	/// <summary>
 	/// Rebuilds the map from an already maintained script index and returns true
-	/// when the on-disk generated contents changed.
+	/// when the generated contents changed for that particular index consumer.
 	/// </summary>
 	public static bool Generate(CreatorSession session, IEnumerable<Script> scripts)
 	{
@@ -55,10 +68,9 @@ public static class LuauModuleMapService
 	}
 
 	/// <summary>
-	/// Rebuilds the map and also returns the complete generated snapshot. Each
-	/// language-server client must compare this snapshot with the last map it
-	/// personally applied instead of relying only on whether another service has
-	/// already written the same contents to disk.
+	/// Rebuilds the map and also returns the complete generated snapshot. The
+	/// returned change flag is scoped to the supplied script-index object rather
+	/// than only to the shared file on disk.
 	/// </summary>
 	public static bool Generate(CreatorSession session, IEnumerable<Script> scripts, out string generatedContent)
 	{
@@ -104,14 +116,20 @@ public static class LuauModuleMapService
 		}
 
 		generatedContent = output.ToString();
+
 		string mapPath = Path.Join(mapDirectory, MapFileName);
-		if (File.Exists(mapPath) && File.ReadAllText(mapPath) == generatedContent)
+		if (!File.Exists(mapPath) || File.ReadAllText(mapPath) != generatedContent)
 		{
-			return false;
+			File.WriteAllText(mapPath, generatedContent);
 		}
 
-		File.WriteAllText(mapPath, generatedContent);
-		return true;
+		ConsumerSnapshot snapshot = ConsumerSnapshots.GetOrCreateValue(scripts);
+		lock (snapshot)
+		{
+			bool changedForConsumer = !string.Equals(snapshot.Content, generatedContent, StringComparison.Ordinal);
+			snapshot.Content = generatedContent;
+			return changedForConsumer;
+		}
 	}
 
 	/// <summary>
