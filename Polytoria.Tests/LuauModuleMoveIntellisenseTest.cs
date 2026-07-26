@@ -3,12 +3,8 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 using Polytoria.Creator.LSP;
-using Polytoria.Creator.LSP.Schemas;
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
-using System.IO;
-using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -20,173 +16,101 @@ public class LuauModuleMoveIntellisenseTest
 	public async Task MoveBeforeRequireEditAndExportChangesStayInSync()
 	{
 		CancellationToken testCancellation = TestContext.Current.CancellationToken;
-		string repositoryRoot = FindRepositoryRoot();
-		string workspacePath = Path.Join(Path.GetTempPath(), "polytoria-module-move-lsp-" + Guid.NewGuid().ToString("N"));
-		Directory.CreateDirectory(workspacePath);
+		using LuauLspTestWorkspace workspace = new("polytoria-module-move-lsp");
 
-		Process? process = null;
-		LspClient? client = null;
+		string mapPath = workspace.GetPath($".poly/luau/{LuauModuleMapService.MapFileName}");
+		string initialModuleSource = """
+			local MathUtil = {}
+			MathUtil.Version = "1.0"
 
-		try
-		{
-			string pluginDirectory = Path.Join(workspacePath, ".poly", "luau");
-			string moduleDirectory = Path.Join(workspacePath, "scripts", "modules");
-			string serverDirectory = Path.Join(workspacePath, "scripts", "server");
-			Directory.CreateDirectory(pluginDirectory);
-			Directory.CreateDirectory(moduleDirectory);
-			Directory.CreateDirectory(serverDirectory);
+			function MathUtil.double(value)
+				return value * 2
+			end
 
-			File.WriteAllText(Path.Join(workspacePath, ".luaurc"), "{\n\t\"languageMode\": \"nocheck\"\n}\n");
-			CopyPlugin(repositoryRoot, pluginDirectory, "polytoria-require.luau");
-			CopyPlugin(repositoryRoot, pluginDirectory, "polytoria-module-types.luau");
+			return MathUtil
+			""";
+		string modulePath = workspace.WriteFile("scripts/modules/MathUtil.luau", initialModuleSource);
 
-			string mapPath = Path.Join(pluginDirectory, LuauModuleMapService.MapFileName);
-			string modulePath = Path.Join(moduleDirectory, "MathUtil.luau");
-			string serverPath = Path.Join(serverDirectory, "Test.server.luau");
+		string initialServerSource = CreateServerSource("world.ScriptService.MathUtil");
+		string serverPath = workspace.WriteFile("scripts/server/Test.server.luau", initialServerSource);
+		WriteModuleMap(workspace, "world.ScriptService.MathUtil");
 
-			string initialModuleSource = """
-				local MathUtil = {}
-				MathUtil.Version = "1.0"
+		await RestartAsync(workspace, modulePath, initialModuleSource, serverPath, initialServerSource, testCancellation);
 
-				function MathUtil.double(value)
-					return value * 2
-				end
+		HashSet<string> labels = await WaitForMathUtilAsync(
+			workspace,
+			serverPath,
+			labels => labels.Contains("Version") && labels.Contains("double"),
+			testCancellation);
+		Assert.Contains("Version", labels);
+		Assert.Contains("double", labels);
 
-				return MathUtil
-				""";
-			string initialServerSource = CreateServerSource("world.ScriptService.MathUtil");
+		// Reproduce the order that previously broke completion: move the ModuleScript,
+		// let Creator's module-map change restart the language server while the source
+		// still contains the old require, and only then edit the require expression.
+		WriteModuleMap(workspace, "world.Environment.MathUtil");
+		await RestartAsync(workspace, modulePath, initialModuleSource, serverPath, initialServerSource, testCancellation);
 
-			File.WriteAllText(modulePath, initialModuleSource);
-			File.WriteAllText(serverPath, initialServerSource);
-			WriteModuleMap(mapPath, "world.ScriptService.MathUtil");
+		string movedServerSource = CreateServerSource("world.Environment.MathUtil");
+		workspace.WriteFile("scripts/server/Test.server.luau", movedServerSource);
+		await workspace.Client.DidChangeAsync(serverPath, movedServerSource, 2);
 
-			(process, client) = await StartClientAsync(
-				repositoryRoot,
-				workspacePath,
-				modulePath,
-				initialModuleSource,
-				serverPath,
-				initialServerSource,
-				testCancellation);
+		labels = await WaitForMathUtilAsync(
+			workspace,
+			serverPath,
+			labels => labels.Contains("Version") && labels.Contains("double"),
+			testCancellation);
+		Assert.Contains("Version", labels);
+		Assert.Contains("double", labels);
 
-			HashSet<string> labels = await WaitForCompletionsAsync(
-				client,
-				serverPath,
-				labels => labels.Contains("Version") && labels.Contains("double"),
-				testCancellation);
-			Assert.Contains("Version", labels);
-			Assert.Contains("double", labels);
+		string addedExportSource = """
+			local MathUtil = {}
+			MathUtil.Version = "1.1"
 
-			// Reproduce the order that previously broke completion: move the ModuleScript,
-			// let Creator's module-map change restart the language server while the source
-			// still contains the old require, and only then edit the require expression.
-			WriteModuleMap(mapPath, "world.Environment.MathUtil");
-			StopClient(process, client);
-			process = null;
-			client = null;
+			function MathUtil.double(value)
+				return value * 2
+			end
 
-			(process, client) = await StartClientAsync(
-				repositoryRoot,
-				workspacePath,
-				modulePath,
-				initialModuleSource,
-				serverPath,
-				initialServerSource,
-				testCancellation);
+			function MathUtil.triple(value)
+				return value * 3
+			end
 
-			string movedServerSource = CreateServerSource("world.Environment.MathUtil");
-			File.WriteAllText(serverPath, movedServerSource);
-			await client.DidChangeAsync(serverPath, movedServerSource, 2);
+			return MathUtil
+			""";
+		workspace.WriteFile("scripts/modules/MathUtil.luau", addedExportSource);
 
-			labels = await WaitForCompletionsAsync(
-				client,
-				serverPath,
-				labels => labels.Contains("Version") && labels.Contains("double"),
-				testCancellation);
-			Assert.Contains("Version", labels);
-			Assert.Contains("double", labels);
+		// LuaCompletionService intentionally restarts the built-in language server
+		// when a linked ModuleScript file changes so source-transform plugins rerun.
+		await RestartAsync(workspace, modulePath, addedExportSource, serverPath, movedServerSource, testCancellation);
 
-			string addedExportSource = """
-				local MathUtil = {}
-				MathUtil.Version = "1.1"
+		labels = await WaitForMathUtilAsync(
+			workspace,
+			serverPath,
+			labels => labels.Contains("double") && labels.Contains("triple"),
+			testCancellation);
+		Assert.Contains("double", labels);
+		Assert.Contains("triple", labels);
 
-				function MathUtil.double(value)
-					return value * 2
-				end
+		string removedExportSource = """
+			local MathUtil = {}
+			MathUtil.Version = "1.2"
 
-				function MathUtil.triple(value)
-					return value * 3
-				end
+			function MathUtil.triple(value)
+				return value * 3
+			end
 
-				return MathUtil
-				""";
-			File.WriteAllText(modulePath, addedExportSource);
+			return MathUtil
+			""";
+		workspace.WriteFile("scripts/modules/MathUtil.luau", removedExportSource);
+		await RestartAsync(workspace, modulePath, removedExportSource, serverPath, movedServerSource, testCancellation);
 
-			// LuaCompletionService intentionally restarts the built-in language server
-			// when a linked ModuleScript file changes. The source-transform plugins are
-			// applied during indexing, so a raw didChange on LspClient is not the same
-			// operation as Creator's production refresh path.
-			StopClient(process, client);
-			process = null;
-			client = null;
-			(process, client) = await StartClientAsync(
-				repositoryRoot,
-				workspacePath,
-				modulePath,
-				addedExportSource,
-				serverPath,
-				movedServerSource,
-				testCancellation);
-
-			labels = await WaitForCompletionsAsync(
-				client,
-				serverPath,
-				labels => labels.Contains("double") && labels.Contains("triple"),
-				testCancellation);
-			Assert.Contains("double", labels);
-			Assert.Contains("triple", labels);
-
-			string removedExportSource = """
-				local MathUtil = {}
-				MathUtil.Version = "1.2"
-
-				function MathUtil.triple(value)
-					return value * 3
-				end
-
-				return MathUtil
-				""";
-			File.WriteAllText(modulePath, removedExportSource);
-
-			StopClient(process, client);
-			process = null;
-			client = null;
-			(process, client) = await StartClientAsync(
-				repositoryRoot,
-				workspacePath,
-				modulePath,
-				removedExportSource,
-				serverPath,
-				movedServerSource,
-				testCancellation);
-
-			labels = await WaitForCompletionsAsync(
-				client,
-				serverPath,
-				labels => labels.Contains("triple") && !labels.Contains("double"),
-				testCancellation);
-			Assert.Contains("triple", labels);
-			Assert.DoesNotContain("double", labels);
-		}
-		finally
-		{
-			StopClient(process, client);
-
-			if (Directory.Exists(workspacePath))
-			{
-				Directory.Delete(workspacePath, recursive: true);
-			}
-		}
+		labels = await WaitForMathUtilAsync(
+			workspace,
+			serverPath,
+			labels => labels.Contains("triple") && !labels.Contains("double"),
+			testCancellation);
+		Assert.Contains("triple", labels);
+		Assert.DoesNotContain("double", labels);
 	}
 
 	private static string CreateServerSource(string moduleWorldPath)
@@ -194,7 +118,7 @@ public class LuauModuleMoveIntellisenseTest
 		return $"local MathUtil = require({moduleWorldPath})\nMathUtil.\n";
 	}
 
-	private static void WriteModuleMap(string mapPath, string moduleWorldPath)
+	private static void WriteModuleMap(LuauLspTestWorkspace workspace, string moduleWorldPath)
 	{
 		string content = $"""
 			# Polytoria Luau module map v2
@@ -203,182 +127,38 @@ public class LuauModuleMoveIntellisenseTest
 			S	0	scripts/server/Test.server.luau	world.ScriptService.Test
 			M	0	{moduleWorldPath}	scripts/modules/MathUtil.luau
 			""";
-		File.WriteAllText(mapPath, content.Replace("\r\n", "\n", StringComparison.Ordinal));
+		workspace.WriteFile(
+			$".poly/luau/{LuauModuleMapService.MapFileName}",
+			content.Replace("\r\n", "\n", StringComparison.Ordinal));
 	}
 
-	private static async Task<(Process Process, LspClient Client)> StartClientAsync(
-		string repositoryRoot,
-		string workspacePath,
+	private static Task RestartAsync(
+		LuauLspTestWorkspace workspace,
 		string modulePath,
 		string moduleSource,
 		string serverPath,
 		string serverSource,
 		CancellationToken cancellationToken)
 	{
-		Process process = StartLanguageServer(repositoryRoot, workspacePath);
-		_ = process.StandardError.ReadToEndAsync(cancellationToken);
-
-		LspClient client = new(process.StandardOutput.BaseStream, process.StandardInput.BaseStream);
-		await client.InitializeAsync(workspacePath);
-		await client.DidOpenAsync(modulePath, "luau", moduleSource);
-		await client.DidOpenAsync(serverPath, "luau", serverSource);
-		return (process, client);
+		return workspace.RestartAsync(
+			[
+				(modulePath, moduleSource),
+				(serverPath, serverSource)
+			],
+			cancellationToken);
 	}
 
-	private static async Task<HashSet<string>> WaitForCompletionsAsync(
-		LspClient client,
+	private static Task<HashSet<string>> WaitForMathUtilAsync(
+		LuauLspTestWorkspace workspace,
 		string serverPath,
 		Func<HashSet<string>, bool> condition,
-		CancellationToken testCancellation)
+		CancellationToken cancellationToken)
 	{
-		HashSet<string> labels = [];
-		using CancellationTokenSource timeout = CancellationTokenSource.CreateLinkedTokenSource(testCancellation);
-		timeout.CancelAfter(TimeSpan.FromSeconds(15));
-
-		while (!timeout.IsCancellationRequested)
-		{
-			try
-			{
-				LspCompletionItem[]? items = await client.RequestCompletionAsync(
-					serverPath,
-					1,
-					"MathUtil.".Length,
-					timeout.Token);
-
-				labels = items?
-					.Select(item => item.Label ?? "")
-					.Where(label => label.Length > 0)
-					.ToHashSet(StringComparer.Ordinal) ?? [];
-
-				if (condition(labels))
-				{
-					break;
-				}
-
-				await Task.Delay(200, timeout.Token);
-			}
-			catch (OperationCanceledException) when (timeout.IsCancellationRequested)
-			{
-				break;
-			}
-		}
-
-		return labels;
-	}
-
-	private static Process StartLanguageServer(string repositoryRoot, string workspacePath)
-	{
-		string platformDirectory;
-		string executableName;
-
-		if (OperatingSystem.IsWindows())
-		{
-			platformDirectory = "windows";
-			executableName = "luau-lsp.exe";
-		}
-		else if (OperatingSystem.IsLinux())
-		{
-			platformDirectory = "linux";
-			executableName = "luau-lsp";
-		}
-		else if (OperatingSystem.IsMacOS())
-		{
-			platformDirectory = "macos";
-			executableName = "luau-lsp";
-		}
-		else
-		{
-			throw new PlatformNotSupportedException("Luau LSP regression tests require Windows, Linux, or macOS.");
-		}
-
-		string executablePath = Path.Join(
-			repositoryRoot,
-			"Polytoria",
-			"native",
-			"luau-lsp",
-			platformDirectory,
-			executableName);
-
-		Assert.True(File.Exists(executablePath), $"Bundled Luau LSP was not found at {executablePath}");
-
-		if (!OperatingSystem.IsWindows())
-		{
-			File.SetUnixFileMode(
-				executablePath,
-				UnixFileMode.UserRead |
-				UnixFileMode.UserWrite |
-				UnixFileMode.UserExecute |
-				UnixFileMode.GroupRead |
-				UnixFileMode.GroupExecute |
-				UnixFileMode.OtherRead |
-				UnixFileMode.OtherExecute);
-		}
-
-		ProcessStartInfo startInfo = new()
-		{
-			FileName = executablePath,
-			Arguments = "lsp --stdio",
-			RedirectStandardInput = true,
-			RedirectStandardOutput = true,
-			RedirectStandardError = true,
-			UseShellExecute = false,
-			CreateNoWindow = true,
-			WorkingDirectory = workspacePath
-		};
-
-		return Process.Start(startInfo) ?? throw new InvalidOperationException("Failed to start the bundled Luau LSP.");
-	}
-
-	private static void StopClient(Process? process, LspClient? client)
-	{
-		if (process != null)
-		{
-			try
-			{
-				if (!process.HasExited)
-				{
-					process.Kill(entireProcessTree: true);
-					process.WaitForExit(5000);
-				}
-			}
-			catch (InvalidOperationException)
-			{
-				// The process exited while the test was cleaning up.
-			}
-		}
-
-		client?.Dispose();
-		process?.Dispose();
-	}
-
-	private static void CopyPlugin(string repositoryRoot, string destinationDirectory, string fileName)
-	{
-		string sourcePath = Path.Join(
-			repositoryRoot,
-			"Polytoria",
-			"modules",
-			"creator",
-			"codehint",
-			"luau",
-			fileName);
-
-		Assert.True(File.Exists(sourcePath), $"Luau plugin was not found at {sourcePath}");
-		File.Copy(sourcePath, Path.Join(destinationDirectory, fileName));
-	}
-
-	private static string FindRepositoryRoot()
-	{
-		DirectoryInfo? directory = new(AppContext.BaseDirectory);
-		while (directory != null)
-		{
-			if (File.Exists(Path.Join(directory.FullName, "Polytoria.sln")))
-			{
-				return directory.FullName;
-			}
-
-			directory = directory.Parent;
-		}
-
-		throw new DirectoryNotFoundException("Could not locate the Polytoria repository root from the test output directory.");
+		return workspace.WaitForCompletionsAsync(
+			serverPath,
+			1,
+			"MathUtil.".Length,
+			condition,
+			cancellationToken);
 	}
 }
