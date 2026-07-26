@@ -22,6 +22,8 @@ public class LuaCompletionService(CreatorSession session)
 	private LspClient _client = null!;
 	private readonly Dictionary<string, int> _versions = new(StringComparer.OrdinalIgnoreCase);
 	private readonly Dictionary<string, string> _lastSyncedContent = new(StringComparer.OrdinalIgnoreCase);
+	private readonly Dictionary<string, long> _lastDependencyRevision = new(StringComparer.OrdinalIgnoreCase);
+	private long _moduleRevision;
 
 	public event Action<string, List<LspDiagnostic>>? PublishDiagnostics;
 
@@ -101,6 +103,7 @@ public class LuaCompletionService(CreatorSession session)
 		string content = File.ReadAllText(scriptPath);
 		_versions[scriptPath] = 1;
 		_lastSyncedContent[scriptPath] = content;
+		_lastDependencyRevision[scriptPath] = _moduleRevision;
 		await _client.DidOpenAsync(scriptPath, "luau", content);
 	}
 
@@ -108,14 +111,16 @@ public class LuaCompletionService(CreatorSession session)
 	{
 		_versions.Remove(scriptPath);
 		_lastSyncedContent.Remove(scriptPath);
+		_lastDependencyRevision.Remove(scriptPath);
 		await _client.DidCloseAsync(scriptPath);
 	}
 
 	public async Task UpdateScriptChangeAsync(string scriptPath, string scriptContent, bool force = false)
 	{
-		if (!force &&
-			_lastSyncedContent.TryGetValue(scriptPath, out string? previousContent) &&
-			previousContent == scriptContent)
+		bool contentChanged = !_lastSyncedContent.TryGetValue(scriptPath, out string? previousContent) ||
+			previousContent != scriptContent;
+
+		if (!force && !contentChanged)
 		{
 			return;
 		}
@@ -124,6 +129,14 @@ public class LuaCompletionService(CreatorSession session)
 		_versions[scriptPath] = version;
 		_lastSyncedContent[scriptPath] = scriptContent;
 		await _client.DidChangeAsync(scriptPath, scriptContent, version);
+
+		// Luau LSP can retain completion results for scripts that require an edited
+		// module. Record a dependency revision so each requiring editor buffer is
+		// refreshed once before its next completion request.
+		if (contentChanged && LuauModuleMapService.IsLinkedModuleFile(_session, scriptPath))
+		{
+			_moduleRevision++;
+		}
 	}
 
 	public async Task<List<CodeEditCompletionItem>> GetCompletionsAsync(CodeEditCompletionContext context, CancellationToken? cancelToken = null)
@@ -134,9 +147,18 @@ public class LuaCompletionService(CreatorSession session)
 		// scripts located outside ScriptService are reflected immediately.
 		bool moduleMapChanged = LuauModuleMapService.Generate(_session);
 
-		// Synchronize the exact in-memory buffer. When the map changed, sending the
-		// same source at a new version also invalidates Luau LSP's transformed cache.
-		await UpdateScriptChangeAsync(context.ScriptPath, context.Content, moduleMapChanged);
+		long lastRevision = _lastDependencyRevision.TryGetValue(context.ScriptPath, out long revision)
+			? revision
+			: -1;
+		bool moduleDependencyChanged = lastRevision != _moduleRevision;
+
+		// Synchronize the exact in-memory buffer. A map change or edited module
+		// forces one fresh document version so Luau LSP rebuilds require inference.
+		await UpdateScriptChangeAsync(
+			context.ScriptPath,
+			context.Content,
+			moduleMapChanged || moduleDependencyChanged);
+		_lastDependencyRevision[context.ScriptPath] = _moduleRevision;
 
 		LspCompletionItem[]? completionResult = await _client.RequestCompletionAsync(
 			context.ScriptPath,
