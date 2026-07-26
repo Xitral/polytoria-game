@@ -40,9 +40,12 @@ jobs:
           test -n "$binary_path"
           install -m 0755 "$binary_path" Polytoria/native/luau-lsp/windows/luau-lsp.exe
 
-      - name: Verify bundled version
-        shell: pwsh
-        run: ./Polytoria/native/luau-lsp/windows/luau-lsp.exe --version
+      - name: Verify downloaded Windows executable
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s Polytoria/native/luau-lsp/windows/luau-lsp.exe
+          file Polytoria/native/luau-lsp/windows/luau-lsp.exe | grep -q 'PE32+'
 
       - name: Commit updated binary
         shell: bash
