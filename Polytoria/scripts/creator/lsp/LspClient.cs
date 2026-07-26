@@ -22,7 +22,8 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 		"./.poly/luau/polytoria-module-types.luau"
 	];
 
-	private readonly TaskCompletionSource _workspaceReady = new(TaskCreationOptions.RunContinuationsAsynchronously);
+	private readonly TaskCompletionSource _completionReady = new(TaskCreationOptions.RunContinuationsAsynchronously);
+	private int _readinessTimeoutReported;
 
 	public readonly Dictionary<string, string> LspPathToFull = new(StringComparer.OrdinalIgnoreCase);
 	public readonly Dictionary<string, string> FullToLspPath = new(StringComparer.OrdinalIgnoreCase);
@@ -72,28 +73,36 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 		await SendRequestAsync<LspInitializeResult>("initialize", initParams);
 		await SendNotificationAsync("initialized", new EmptyParams());
 
-		// The initialize response only confirms the JSON-RPC handshake. Luau LSP
-		// loads configuration, definitions, plugins, and workspace files afterward.
-		// Do not allow callers to request completions against that half-initialized
-		// workspace, which otherwise produces a one-off empty result after restarts.
-		using CancellationTokenSource readinessTimeout = new(TimeSpan.FromSeconds(30));
-		try
-		{
-			await WaitUntilWorkspaceReadyAsync(readinessTimeout.Token);
-		}
-		catch (OperationCanceledException)
-		{
-			PT.PrintWarn("Timed out waiting for Luau LSP workspace indexing; continuing with partial language-server state");
-		}
+		// Do not wait for indexing here. Blocking initialization also blocks every
+		// editor open/change/completion call behind LuaCompletionService's gate.
+		// Completion requests wait for plugin readiness independently instead.
 	}
 
-	/// <summary>
-	/// Completes after Luau LSP has loaded configuration/plugins and finished its
-	/// initial workspace index.
-	/// </summary>
-	public Task WaitUntilWorkspaceReadyAsync(CancellationToken cancellationToken = default)
+	private async Task WaitUntilCompletionReadyAsync(CancellationToken cancellationToken)
 	{
-		return _workspaceReady.Task.WaitAsync(cancellationToken);
+		if (_completionReady.Task.IsCompleted)
+		{
+			return;
+		}
+
+		using CancellationTokenSource timeout = new(TimeSpan.FromSeconds(5));
+		using CancellationTokenSource combined = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeout.Token);
+
+		try
+		{
+			await _completionReady.Task.WaitAsync(combined.Token);
+		}
+		catch (OperationCanceledException) when (timeout.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+		{
+			if (Interlocked.Exchange(ref _readinessTimeoutReported, 1) == 0)
+			{
+				PT.PrintWarn("Timed out waiting for Luau LSP plugins; continuing with the current language-server state");
+			}
+
+			// Avoid adding the same delay to every later completion request. A later
+			// plugin/index message can still call TrySetResult harmlessly.
+			_completionReady.TrySetResult();
+		}
 	}
 
 	public Task DidOpenAsync(string path, string languageId, string text)
@@ -137,6 +146,11 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 
 	public async Task<LspCompletionItem[]?> RequestCompletionAsync(string path, int line, int character, CancellationToken cancellationToken)
 	{
+		// A restarted Luau server acknowledges initialize before loading the source
+		// transformation plugins. Waiting here prevents the first completion request
+		// from racing that load while leaving the rest of Creator responsive.
+		await WaitUntilCompletionReadyAsync(cancellationToken);
+
 		JsonElement rawResult = await SendRequestAsync<JsonElement>("textDocument/completion", new LspCompletionParams
 		{
 			TextDocument = new() { Uri = LspHelper.PathToUri(path) },
@@ -194,11 +208,13 @@ public class LspClient(Stream input, Stream output) : LspClientBase(input, outpu
 			string messageText = message.GetString() ?? "";
 			PT.Print("Luau LSP: ", messageText);
 
-			// This is emitted after configuration, definition files, plugins, and all
-			// workspace source files have been loaded and parsed.
-			if (messageText.StartsWith("Indexed ", StringComparison.Ordinal))
+			// Module completion only depends on the transformation plugins being loaded.
+			// Indexing may finish afterward and is still useful, but it should not block
+			// the editor or ordinary completion startup.
+			if (messageText.StartsWith($"Loaded {PluginPaths.Length} of {PluginPaths.Length} plugins", StringComparison.Ordinal) ||
+				messageText.StartsWith("Indexed ", StringComparison.Ordinal))
 			{
-				_workspaceReady.TrySetResult();
+				_completionReady.TrySetResult();
 			}
 		}
 	}
