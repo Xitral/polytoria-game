@@ -24,11 +24,15 @@ public sealed partial class VSCodeModuleMapSyncService : Node
 	private CreatorSession _session = null!;
 	private readonly HashSet<World> _trackedWorlds = [];
 	private readonly List<World> _worldOrder = [];
+	private readonly Dictionary<World, int> _worldInstanceCounts = [];
 	private readonly HashSet<Instance> _trackedInstances = [];
 	private readonly HashSet<DataModelScript> _trackedScripts = [];
+	private readonly Dictionary<DataModelScript, ScriptMapState> _scriptMapStates = [];
 	private bool _wasActive;
 	private bool _mapDirty = true;
 	private bool _refreshQueued;
+
+	private readonly record struct ScriptMapState(string WorldPath, string? LinkedPath);
 
 	public VSCodeModuleMapSyncService()
 	{
@@ -126,6 +130,7 @@ public sealed partial class VSCodeModuleMapSyncService : Node
 			bool containedScripts = SubtreeContainsScript(removedWorld);
 			UntrackSubtree(removedWorld);
 			_trackedWorlds.Remove(removedWorld);
+			_worldInstanceCounts.Remove(removedWorld);
 			if (containedScripts)
 			{
 				MarkMapDirty();
@@ -134,10 +139,34 @@ public sealed partial class VSCodeModuleMapSyncService : Node
 
 		foreach (World world in _session.OpenedWorlds)
 		{
-			if (_trackedWorlds.Add(world) && TrackSubtree(world))
+			if (_trackedWorlds.Add(world))
 			{
-				MarkMapDirty();
+				_worldInstanceCounts[world] = world.InstanceCount;
+				if (TrackSubtree(world))
+				{
+					MarkMapDirty();
+				}
 			}
+			else if (!_worldInstanceCounts.TryGetValue(world, out int previousCount) || previousCount != world.InstanceCount)
+			{
+				// Some import/deserialization paths add a complete subtree without emitting
+				// the ordinary ChildAdded signal. Reconcile whenever the authoritative world
+				// instance count changes so VS Code does not depend on the built-in editor's
+				// separate script index to discover toolbox modules.
+				_worldInstanceCounts[world] = world.InstanceCount;
+				if (TrackSubtree(world))
+				{
+					MarkMapDirty();
+				}
+			}
+		}
+
+		// LinkedScript may be assigned after an imported Instance enters the tree.
+		// Comparing the tracked state catches missed property notifications and path
+		// changes that occur while the external editor is already open.
+		if (RefreshScriptMapStates())
+		{
+			MarkMapDirty();
 		}
 
 		if (worldOrderChanged)
@@ -150,29 +179,29 @@ public sealed partial class VSCodeModuleMapSyncService : Node
 
 	private bool TrackSubtree(Instance instance)
 	{
-		if (!_trackedInstances.Add(instance))
+		bool addedScript = false;
+		if (_trackedInstances.Add(instance))
 		{
-			return SubtreeContainsScript(instance);
+			instance.ChildAdded.Connect(OnTrackedChildAdded);
+			instance.ChildRemoved.Connect(OnTrackedChildRemoved);
+			instance.Renamed.Connect(OnTrackedInstanceRenamed);
+
+			if (instance is DataModelScript script && _trackedScripts.Add(script))
+			{
+				script.PropertyChanged.Connect(OnTrackedScriptPropertyChanged);
+				_scriptMapStates[script] = GetScriptMapState(script);
+				addedScript = true;
+			}
 		}
 
-		instance.ChildAdded.Connect(OnTrackedChildAdded);
-		instance.ChildRemoved.Connect(OnTrackedChildRemoved);
-		instance.Renamed.Connect(OnTrackedInstanceRenamed);
-
-		bool containsScript = false;
-		if (instance is DataModelScript script)
-		{
-			_trackedScripts.Add(script);
-			script.PropertyChanged.Connect(OnTrackedScriptPropertyChanged);
-			containsScript = true;
-		}
-
+		// Always recurse. A parent can already be tracked while an imported child was
+		// inserted through a path that did not emit ChildAdded.
 		foreach (Instance child in instance.GetChildren())
 		{
-			containsScript |= TrackSubtree(child);
+			addedScript |= TrackSubtree(child);
 		}
 
-		return containsScript;
+		return addedScript;
 	}
 
 	private void UntrackSubtree(Instance instance)
@@ -195,6 +224,7 @@ public sealed partial class VSCodeModuleMapSyncService : Node
 		{
 			script.PropertyChanged.Disconnect(OnTrackedScriptPropertyChanged);
 			_trackedScripts.Remove(script);
+			_scriptMapStates.Remove(script);
 		}
 	}
 
@@ -208,6 +238,8 @@ public sealed partial class VSCodeModuleMapSyncService : Node
 
 		_trackedWorlds.Clear();
 		_worldOrder.Clear();
+		_worldInstanceCounts.Clear();
+		_scriptMapStates.Clear();
 	}
 
 	private void OnTrackedChildAdded(Instance child)
@@ -239,6 +271,26 @@ public sealed partial class VSCodeModuleMapSyncService : Node
 		{
 			MarkMapDirty();
 		}
+	}
+
+	private bool RefreshScriptMapStates()
+	{
+		bool changed = false;
+		foreach (DataModelScript script in _trackedScripts)
+		{
+			ScriptMapState current = GetScriptMapState(script);
+			if (!_scriptMapStates.TryGetValue(script, out ScriptMapState previous) || previous != current)
+			{
+				_scriptMapStates[script] = current;
+				changed = true;
+			}
+		}
+		return changed;
+	}
+
+	private static ScriptMapState GetScriptMapState(DataModelScript script)
+	{
+		return new(script.LuaPath, script.LinkedScript?.LinkedPath);
 	}
 
 	private void MarkMapDirty()
